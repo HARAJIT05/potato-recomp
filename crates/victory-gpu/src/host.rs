@@ -182,6 +182,28 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
 }
 
+/// Texture eviction policy (`(idle_ms, max_bytes)`) accounting for DXGI shared
+/// memory spill on discrete 4-6 GiB cards and system-RAM pressure.
+pub(crate) fn texture_eviction_policy(
+    budget: u64,
+    used: u64,
+    shared_used: u64,
+    discrete_low_vram: bool,
+    ram_pressured: bool,
+) -> (u64, u64) {
+    const SPILL_WATCH: u64 = 256 << 20;
+    const SPILL_CRITICAL: u64 = 512 << 20;
+    const HIGH_MS: u64 = 1_000;
+    if ram_pressured || (discrete_low_vram && shared_used > SPILL_CRITICAL) {
+        return (HIGH_MS, u64::MAX);
+    }
+    if discrete_low_vram && shared_used > SPILL_WATCH {
+        let excess = used.saturating_sub(budget / 100 * 75).saturating_add(shared_used - SPILL_WATCH);
+        return (HIGH_MS, excess.max(64 << 20));
+    }
+    vram_keep(budget, used)
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -556,10 +578,13 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let video = host().and_then(|h| h.video_memory());
+    let discrete_spill = host().is_some_and(Host::is_discrete_low_vram)
+        && video.is_some_and(|[_, _, _, shared]| shared > (256 << 20));
+    if crate::residency::pressured() || discrete_spill {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::room(video);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -9367,15 +9392,6 @@ impl Meter {
         let five = self.logged.elapsed() >= std::time::Duration::from_secs(5);
         if five {
             self.logged = std::time::Instant::now();
-            static FPS_LOG: OnceLock<bool> = OnceLock::new();
-            if *FPS_LOG.get_or_init(|| std::env::var_os("VICTORY_FPS_LOG").is_some_and(|v| v == "1")) {
-                tracing::warn!(
-                    fps = format_args!("{fps:.1}"),
-                    ms = format_args!("{ms:.1}"),
-                    draws = format_args!("{draws:.0}"),
-                    "benchmark frame timing (VICTORY_FPS_LOG=1)"
-                );
-            }
         }
         #[cfg(feature = "diagnostics")]
         let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
@@ -9391,6 +9407,30 @@ impl Meter {
             let [back_ms, back_mb] = [0, 1].map(|i| {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
+            if five {
+                static FPS_LOG: OnceLock<bool> = OnceLock::new();
+                if *FPS_LOG.get_or_init(|| std::env::var_os("VICTORY_FPS_LOG").is_some_and(|v| v == "1")) {
+                    let [budget_mb, own_mb, shared_mb] = host()
+                        .and_then(|h| h.video_memory())
+                        .map_or([0, 0, 0], |[b, u, _, s]| [b >> 20, u >> 20, s >> 20]);
+                    let avail_ram_mb = available_physical_ram().map_or(0, |p| p >> 20);
+                    tracing::warn!(
+                        fps = format_args!("{fps:.1}"),
+                        ms = format_args!("{ms:.1}"),
+                        draws = format_args!("{draws:.0}"),
+                        cpu_ms = format_args!("{cpu:.1}"),
+                        gpu_ms = format_args!("{gpu:.1}"),
+                        copy_ms = format_args!("{copy_ms:.1}"),
+                        texture_ms = format_args!("{texture_ms:.1}"),
+                        back_ms = format_args!("{back_ms:.1}"),
+                        own_mb,
+                        budget_mb,
+                        shared_mb,
+                        avail_ram_mb,
+                        "benchmark frame timing (VICTORY_FPS_LOG=1)"
+                    );
+                }
+            }
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -10082,6 +10122,11 @@ impl Host {
             let desc = unsafe { adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()? };
             Some(desc.DedicatedVideoMemory as u64)
         })
+    }
+
+    pub(crate) fn is_discrete_low_vram(&self) -> bool {
+        self.dedicated_video_memory()
+            .is_some_and(|d| d > (512 << 20) && d <= (6 << 30))
     }
 
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
@@ -11470,14 +11515,20 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::{texture_eviction_policy, vram_keep};
         let gib = 1 << 30;
+        let mib = 1 << 20;
         assert_eq!(vram_keep(100 * gib, 84 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down.
         assert_eq!(vram_keep(100 * gib, 88 * gib), (5_000, 8 * gib));
         assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 11 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 36 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+        // Discrete <= 6 GiB card spilling > 256 MiB / > 512 MiB to shared RAM, or host RAM pressure:
+        assert_eq!(texture_eviction_policy(3370 * mib, 2000 * mib, 0, true, false).0, 600_000);
+        assert_eq!(texture_eviction_policy(3370 * mib, 3000 * mib, 320 * mib, true, false).0, 1_000);
+        assert_eq!(texture_eviction_policy(3370 * mib, 2000 * mib, 600 * mib, true, false), (1_000, u64::MAX));
+        assert_eq!(texture_eviction_policy(8 * gib, 2 * gib, 0, false, true), (1_000, u64::MAX));
     }
 
     #[test]

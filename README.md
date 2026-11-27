@@ -17,9 +17,11 @@ Reported `60 fps` tags on community tracking dashboards belong to lighter arcade
 
 ## Key Improvements & Stability Fixes (`4 GB` / `16 GB RAM` / Post-Prison Focus)
 
-1. **Out-of-Memory Recovery & 16 GB System-RAM Guard (`host.rs`, `residency.rs`)**
+1. **Out-of-Memory Recovery, Shared-Spill Guard & 16 GB RAM Protection (`host.rs`, `residency.rs`, `resource.rs`, `tiles.rs`, `pool.rs`)**
    - Added `Host::reclaim_on_oom()` / `Host::with_oom_retry()` around `read_back_buffer`, `upload_buffer`, `shared_buffer`, `mapped_card_buffer`, and `uav_buffer` allocations. On `E_OUTOFMEMORY` (`0x8007000E`), it trims spare scratch chunks, triggers emergency pool reclamation, releases idle shadow/texture/resource allocations, notifies `residency::allocation_error()`, and retries once instead of cascading into thousands of failed allocations.
-   - `VICTORY_RESIDENCY` (`residency_enabled`) defaults **on** for `<= 32 GiB` hosts (disable with `VICTORY_RESIDENCY=0`), and `AVAILABLE_PHYS` (`has_physical_growth_reserve`) prevents staging/prefetch growth from thrashing the pagefile on `16 GB` systems.
+   - `VICTORY_RESIDENCY` (`residency_enabled`) defaults **on** for `<= 32 GiB` hosts (disable with `VICTORY_RESIDENCY=0`), and `AVAILABLE_PHYS` (`has_physical_growth_reserve` / `has_physical_upload_reserve`) prevents speculative texture prefetch and staging growth from thrashing the pagefile on `16 GB` systems.
+   - `room_admits()`, `texture_eviction_policy()`, and `pool::room()` now track DXGI **shared-memory spill** on `<= 6 GiB` discrete GPUs (`Host::is_discrete_low_vram()`), pausing new texture admission when `shared_used > 256 MiB`, tightening eviction to `1,000 ms`, trimming spare staging/texture blocks, and auto-capping streamed mip sizes (`auto_texture_max`: `512` -> `256` on `<= 6 GiB` discrete GPUs when `VICTORY_TEXTURE_MAX` is unset).
+   - Shrunk placed tile heap granularity in `tiles.rs` from `64 MiB` (`1,024` tiles) to `8 MiB` (`LOW_VRAM_HEAP_TILES = 128`) on constrained VRAM/RAM hosts (growing dynamically only for giant single mips and releasing empty heaps immediately under pressure).
 2. **Dynamic Descriptor Slot Headroom & Full Port Stack (`descriptor/host.rs`, `descriptor_sites.rs`, `port*.rs`, `plaincopy.rs`, `pipeline.rs`)**
    - Updated `dynamic_slots_on()` so `VICTORY_DYNAMIC_SLOTS` (e.g., `327680`) is honored up to `(null / 2).max(DYNAMIC)` on NVIDIA's 1M-view capped heap (`PORTABLE_VIEWS = 1_000_000`) instead of hard-clamping to `262,144` and stalling post-prison world frames with `no free dynamic descriptor slots`.
    - Integrated `avatarmanz`'s additional descriptor-table copy hooks (`COPY_CALLS` + `COPY_128`, `VICTORY_PORT_COPIES=1`) alongside `Belobug` `PR #354`, plus Renderer Ports 1, 2, 5, 6, and 7:
@@ -37,7 +39,8 @@ Reported `60 fps` tags on community tracking dashboards belong to lighter arcade
    - Restored `missing()` reporting `p.left_out` for intentionally skipped RT/hit pipelines.
 5. **Low-VRAM Budgeting, Aliasing Crash Fix, & Wave/Wait Stability (`host.rs`, `resource.rs`, `pool.rs`, `texture.rs`, `fence.rs`, `victory-shader`, `victory-hle`)**
    - Tracks `POOLED` resources so `record_pool_aliasing_barrier` skips committed non-pooled textures (`VICTORY_TEXTURE_POOL=0` no longer crashes `CommandList::Close()` with `0x80070057`), and uses `LOW_VRAM_BLOCK` (`4 MiB`) / `LOW_MEM_BLOCK` (`16 MiB`) pools on constrained hardware.
-   - Cached `Host::dedicated_video_memory()` and `resource::room_used_limit_bytes()` allow discrete 4 GB GPUs to use up to `VICTORY_TEXTURE_ROOM_PERCENT` (`90%` default in `Play-Potato-4GB.cmd`) of dedicated VRAM while evicting idle allocations against DXGI's budget.
+   - Cached `Host::dedicated_video_memory()` and `resource::room_used_limit_bytes()` balance dedicated VRAM headroom (`VICTORY_TEXTURE_ROOM_PERCENT=75`, `VICTORY_CARD_ROOM_FOR_TARGETS_MB=2048`, `VICTORY_TEXTURE_MAX=256`, `VICTORY_TEXTURE_KEEP=0` in `Play-Potato-4GB.cmd`) while keeping discrete 4 GB cards below WDDM PCIe shared-memory thrash.
+   - Extended `VICTORY_FPS_LOG=1` (`benchmark frame timing`) to include per-frame `cpu_ms`, `gpu_ms`, `copy_ms`, `texture_ms`, `back_ms`, `own_mb`, `budget_mb`, `shared_mb`, and `avail_ram_mb` at `WARN` level every 5 seconds.
    - Bounded `WaitOnAddress` (`250 ms` slices releasing held fence queues), enabled `VICTORY_XMA_REFILL` by default (`VICTORY_XMA_REFILL=0` to disable), restored Wave64->Wave32 lane-mask/guard fixes (`victory-shader`), and added optional PC mouse/keyboard controls (`VICTORY_KBM_PC=1`).
 
 ---
@@ -97,23 +100,23 @@ All checks below ran on Windows with `--locked` (`CARGO_TARGET_DIR` set outside 
 | Asset & file allowlist | `cargo run --locked -p xtask -- policy` | Passed (`asset policy: 275 files ok`) |
 | Workspace Clippy (default) | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed (`0` warnings) |
 | Workspace Clippy (`--all-features`) | `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Passed (`0` warnings) |
-| Release binary | `cargo build --locked --release -p victory` | Passed (`3m 11s`) |
+| Release binary | `cargo build --locked --release -p victory` | Passed (`2m 37s`) |
 
 ### Workspace Test Suite
 
 | Crate / Target | Passed | Failed | Ignored | Time | Notes |
 |---|---:|---:|---:|---|---|
-| `victory` (bin + 4 integration targets) | 32 | 0 | 0 | `5.10s` | `25 + 2 + 3 + 1 + 1` passed |
+| `victory` (bin + 4 integration targets) | 32 | 0 | 0 | `5.01s` | `25 + 2 + 3 + 1 + 1` passed |
 | `victory-core` | 13 | 0 | 0 | `0.01s` | Config & repo-boundary policy tests |
-| `victory-formats` | 41 | 0 | 5 | `12.12s` | Texture swizzling, BCPack, XMA |
+| `victory-formats` | 41 | 0 | 5 | `12.38s` | Texture swizzling, BCPack, XMA |
 | `victory-game` | 3 | 0 | 0 | `0.00s` | `sgd5` container tests |
-| `victory-gpu` (`--lib`) | 408 | 0 | 34 | `39.37s` | Includes `low_vram_room_tests`, `dynamic_slots_honor_override_on_capped_and_uncapped_heaps`, `aliasing_barrier_skips_committed_textures`, `residency_defaults_on_for_limited_ram_and_respects_override`, `a_store_marks_only_the_table_descriptor_it_names`, `the_128_byte_copy_stores_and_marks_its_four_slots`, and both `indirect` tests |
-| `victory-hle` (`--lib` + 2 integration targets) | 165 | 0 | 2 | `3.57s` | `162 + 1` isolated + `1` `fidelityfx` + `1` `no_dll_planting` |
-| `victory-loader` (`--lib` + 2 integration targets) | 60 | 0 | 0 | `1.71s` | `57 + 2 + 1` passed |
+| `victory-gpu` (`--lib`) | 410 | 0 | 34 | `39.34s` | Includes `low_vram_room_tests`, `shared_spill_and_host_pressure_stop_texture_admission_even_below_floor`, `block_tiles_scale_to_8mib_on_low_vram_and_large_levels`, `dynamic_slots_honor_override_on_capped_and_uncapped_heaps`, `aliasing_barrier_skips_committed_textures`, `residency_defaults_on_for_limited_ram_and_respects_override`, `a_store_marks_only_the_table_descriptor_it_names`, `the_128_byte_copy_stores_and_marks_its_four_slots`, and both `indirect` tests |
+| `victory-hle` (`--lib` + 2 integration targets) | 165 | 0 | 2 | `3.38s` | `162 + 1` isolated + `1` `fidelityfx` + `1` `no_dll_planting` |
+| `victory-loader` (`--lib` + 2 integration targets) | 60 | 0 | 0 | `1.06s` | `57 + 2 + 1` passed |
 | `victory-pe` | 36 | 0 | 0 | `0.01s` | PE32+ and import library parser |
-| `victory-pipeline` | 7 | 0 | 0 | `0.10s` | Content-addressed converter cache |
+| `victory-pipeline` | 7 | 0 | 0 | `0.09s` | Content-addressed converter cache |
 | `victory-shader` | 304 | 0 | 4 | `347.03s` | DXIL emission, VALU, waterfall, Wave64->Wave32 tests |
-| `xtask` | 9 | 0 | 0 | — | Policy enforcement and documented switch consistency |
+| `xtask` | 9 | 0 | 0 | `0.84s` | Policy enforcement and documented switch consistency |
 
 ### Local Test Hardware & Observations
 
@@ -142,10 +145,9 @@ All checks below ran on Windows with `--locked` (`CARGO_TARGET_DIR` set outside 
 ## Future Developer Guide: Pushing Low-End Hardware Further
 
 1. **Eliminate Remaining Descriptor Fallback Sites (`descriptor_sites.rs`)**: Post-prison open-world frames occasionally hit unhooked writer PCs (`+0x18849c`, `+0x4e9b4e2`, `+0x2474afc`). Disassembling and adding those copy/store patterns removes fallback descriptor lookups altogether.
-2. **Sub-`64 MiB` `tiles` Heap Packing (`tiles.rs`)**: `tiles` allocates `64 MiB` placed heaps, which restricts eviction when one resident mip tail pins an entire heap. Mirroring `pool.rs`'s `4 MiB` (`LOW_VRAM_BLOCK`) / `16 MiB` strategy or segregating persistent mip tails vs. transient mips would reclaim hundreds of megabytes on 4 GB cards.
-3. **Render-Target Aliasing (`resource.rs`, `host.rs`)**: Series S render targets reserve ~`1.3 GiB` (`VICTORY_CARD_ROOM_FOR_TARGETS_MB=1280`). Aliasing transient G-buffer/shadow render targets with non-overlapping lifetimes frees substantial VRAM on 4 GB cards.
-4. **Complete Wave64 -> Wave32 Compute Lowering (`victory-shader/src/emit/`)**: Remaining dropped compute hashes (`369cbe906ea72764`, `02384a60fda6f2d0`, `6b82bc7d22016cb5`, `5dc3b25986622949`, `6f225b641c5b0708`) fail Wave32 lowering under the safe path; finishing symbolic Wave64 reduction/lane-mask lowering avoids dropped compute dispatches cleanly without `VICTORY_WAVE_WIDE` TDR risk.
-5. **Test Pool vs. Committed Mips & Pre-Warm Caches**: Benchmark `VICTORY_TEXTURE_POOL=0` vs `1` (4 MiB blocks) on open-world saves, and pre-warm with `victory shaders <game-dir>` + `VICTORY_PIPELINE_BOOK=1` + `victory warm`.
+2. **Render-Target Aliasing (`resource.rs`, `host.rs`)**: Series S open-world render targets consume ~`2–3 GiB` (leaving little local budget on 4 GB cards; `Play-Potato-4GB.cmd` reserves `VICTORY_CARD_ROOM_FOR_TARGETS_MB=2048`). Aliasing transient G-buffer/shadow render targets with non-overlapping lifetimes is the biggest remaining lever to eliminate WDDM PCIe shared-memory spills.
+3. **Complete Wave64 -> Wave32 Compute Lowering (`victory-shader/src/emit/`)**: Remaining dropped compute hashes (`369cbe906ea72764`, `02384a60fda6f2d0`, `6b82bc7d22016cb5`, `5dc3b25986622949`, `6f225b641c5b0708`) fail Wave32 lowering under the safe path; finishing symbolic Wave64 reduction/lane-mask lowering avoids dropped compute dispatches cleanly without `VICTORY_WAVE_WIDE` TDR risk.
+4. **Test Pool vs. Committed Mips & Pre-Warm Caches**: Benchmark `VICTORY_TEXTURE_POOL=0` vs `1` (4 MiB blocks) alongside `8 MiB` `tiles` heaps on open-world saves, and pre-warm with `victory shaders <game-dir>` + `VICTORY_PIPELINE_BOOK=1` + `victory warm`.
 
 See also [`docs/findings.md`](docs/findings.md), [`docs/architecture.md`](docs/architecture.md), [`docs/fork-ray-tracing.md`](docs/fork-ray-tracing.md), [`docs/bug-journal.md`](docs/bug-journal.md), and [`docs/replay.md`](docs/replay.md).
 

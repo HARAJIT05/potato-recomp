@@ -1295,10 +1295,26 @@ fn video_memory_percent() -> u64 {
     pct
 }
 
+#[cfg(any(windows, test))]
+fn auto_texture_max(pct: u64, discrete_low_vram: bool) -> u64 {
+    if discrete_low_vram {
+        match pct {
+            0..70 => 512,
+            _ => 256,
+        }
+    } else {
+        match pct {
+            0..92 => 1024,
+            92..97 => 512,
+            _ => 256,
+        }
+    }
+}
+
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
 /// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
-/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+/// of the VRAM budget and 256 from 97 % on 8+ GiB / iGPUs, or 512/256 earlier
+/// on `<= 6 GiB` discrete GPUs).
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1310,10 +1326,9 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..92 => 1024,
-        92..97 => 512,
-        _ => 256,
+    let max = set.unwrap_or_else(|| {
+        let low_vram = crate::host::host().is_some_and(crate::host::Host::is_discrete_low_vram);
+        auto_texture_max(video_memory_percent(), low_vram)
     });
     let mut skip = 0u32;
     while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
@@ -1776,7 +1791,7 @@ fn room_used_limit_bytes(budget: u64, dedicated: Option<u64>, room_percent: u64)
 
 #[cfg(all(test, any(windows, not(windows))))]
 mod low_vram_room_tests {
-    use super::room_used_limit_bytes;
+    use super::{auto_texture_max, room_admits, room_used_limit_bytes};
 
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
@@ -1790,15 +1805,79 @@ mod low_vram_room_tests {
         let rtx_8gb_budget = 7200 * MIB;
         assert_eq!(room_used_limit_bytes(rtx_8gb_budget, Some(8 * GIB), 90), rtx_8gb_budget / 100 * 90);
     }
+
+    #[test]
+    fn shared_spill_and_host_pressure_stop_texture_admission_even_below_floor() {
+        let budget = 3370 * MIB;
+        let dedicated = Some(3965 * MIB);
+        // Calm: below floor admits.
+        assert!(room_admits(Some([budget, 1800 * MIB, 7212 * MIB, 0]), 200 * MIB, 0, 1280 * MIB, dedicated, 75, false));
+        // Discrete PCIe spill > 256 MiB stops new textures even when `filled < floor`.
+        assert!(!room_admits(Some([budget, 3200 * MIB, 7212 * MIB, 300 * MIB]), 200 * MIB, 0, 0, dedicated, 75, false));
+        // Host RAM/commit pressure also stops admission.
+        assert!(!room_admits(Some([budget, 1800 * MIB, 7212 * MIB, 0]), 200 * MIB, 0, 0, dedicated, 75, true));
+        // iGPU uses shared memory normally and is not blocked by discrete-GPU spill cutoffs.
+        assert!(room_admits(Some([6 * GIB, 2 * GIB, 8 * GIB, 1024 * MIB]), 200 * MIB, 0, 0, Some(512 * MIB), 90, false));
+        // Auto texture cap lowers earlier on <= 6 GiB discrete GPUs.
+        assert_eq!(auto_texture_max(50, true), 512);
+        assert_eq!(auto_texture_max(75, true), 256);
+        assert_eq!(auto_texture_max(75, false), 1024);
+    }
+}
+
+#[cfg(any(windows, test))]
+fn room_admits(
+    memory: Option<[u64; 4]>,
+    filled: u64,
+    pool_room: u64,
+    kept: u64,
+    dedicated: Option<u64>,
+    room_percent: u64,
+    host_constrained: bool,
+) -> bool {
+    const WITHOUT_BUDGET: u64 = 4 << 30;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const SPILL_CUTOFF: u64 = 256 << 20;
+    const SPILL_SOFT: u64 = 128 << 20;
+    if host_constrained {
+        return false;
+    }
+    let discrete_low_vram = dedicated.is_some_and(|d| d > 512 * MIB && d <= 6 * GIB);
+    match memory {
+        Some([budget, used, _, shared_used]) => {
+            if discrete_low_vram && shared_used > SPILL_CUTOFF {
+                return false;
+            }
+            let floor = texture_floor_bytes(Some(budget));
+            if filled < floor {
+                return true;
+            }
+            let limit = room_used_limit_bytes(budget, dedicated, room_percent);
+            let effective_limit = if discrete_low_vram && shared_used > SPILL_SOFT {
+                limit.min(budget)
+            } else {
+                limit
+            };
+            let spill_penalty = if discrete_low_vram {
+                shared_used.saturating_sub(SPILL_SOFT)
+            } else {
+                0
+            };
+            used.saturating_sub(pool_room)
+                .saturating_add(kept)
+                .saturating_add(spill_penalty)
+                < effective_limit
+        }
+        None => filled < WITHOUT_BUDGET,
+    }
 }
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
-/// memory in use by this process is under nine tenths of the budget the system
-/// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
-/// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
-/// which ended runs 20 and 24.
+/// up to [`texture_floor_bytes`] bytes of them while shared spill is low,
+/// beyond that while card/shared usage stays under [`room_used_limit_bytes`]
+/// (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes instead).
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1814,22 +1893,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
-        return true;
-    }
-    match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            let dedicated = crate::host::host().and_then(|h| h.dedicated_video_memory());
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < room_used_limit_bytes(budget, dedicated, room_percent())
-        }
-        None => filled < WITHOUT_BUDGET,
-    }
+    let Some(memory) = memory else {
+        return filled < WITHOUT_BUDGET;
+    };
+    let dedicated = crate::host::host().and_then(|h| h.dedicated_video_memory());
+    let host_constrained = crate::residency::critical_commit()
+        || crate::host::available_physical_ram().is_some_and(|p| p < (1 << 30));
+    room_admits(
+        Some(memory),
+        filled,
+        crate::pool::texture_room(),
+        crate::shadow::card_room_kept() + targets_room_kept(),
+        dedicated,
+        room_percent(),
+        host_constrained,
+    )
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2160,15 +2238,21 @@ pub(crate) fn let_go_idle() {
         }
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
+    let discrete_low_vram = crate::host::host().is_some_and(crate::host::Host::is_discrete_low_vram);
+    let ram_pressured = crate::residency::pressured()
+        || crate::host::available_physical_ram().is_some_and(|p| p < (2 << 30));
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
+        Some([budget, used, _, shared_used]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            crate::host::texture_eviction_policy(budget, used, shared_used, discrete_low_vram, ram_pressured)
+        }
+        Some([_, _, _, shared_used]) if (discrete_low_vram && shared_used > (256 << 20)) || ram_pressured => {
+            (1_000, u64::MAX)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };

@@ -59,9 +59,27 @@ use crate::host::host;
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
 
-/// Tiles in one heap of the pool (64 MiB). The largest level given is a
-/// 4096x4096 one of one byte a texel: 256 tiles.
-const HEAP_TILES: u32 = 1024;
+/// Maximum tiles in one heap of the pool (64 MiB). The largest level given
+/// is a 4096x4096 one of one byte a texel: 256 tiles.
+const MAX_HEAP_TILES: u32 = 1024;
+/// Smaller default placed-heap size (8 MiB) on constrained VRAM / RAM hosts
+/// so idle mip tiles release whole heaps cleanly back to WDDM.
+const LOW_VRAM_HEAP_TILES: u32 = 128;
+
+fn default_heap_tiles() -> u32 {
+    if crate::residency::limited_host_ram() || host().is_some_and(crate::host::Host::is_discrete_low_vram) {
+        LOW_VRAM_HEAP_TILES
+    } else {
+        MAX_HEAP_TILES
+    }
+}
+
+fn block_tiles_for(count: u32, default_tiles: u32) -> Option<u32> {
+    if count == 0 || count > MAX_HEAP_TILES {
+        return None;
+    }
+    Some(default_tiles.max(count.next_power_of_two()).min(MAX_HEAP_TILES))
+}
 
 /// Since the start, or now: such textures alive; the bytes all their
 /// levels would take; the bytes of the tiles given to them; the bytes of
@@ -130,6 +148,7 @@ pub(crate) fn given_total() -> u64 {
 /// order, no two touching.
 struct Heap {
     heap: ID3D12Heap,
+    total: u32,
     free: Vec<(u32, u32)>,
 }
 
@@ -152,16 +171,14 @@ static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
 /// the heap, its place in the pool and the runs (first tile, tiles). A new
 /// heap is made when no heap has that many free.
 fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u32, u32)>)> {
-    if count == 0 || count > HEAP_TILES {
-        return None;
-    }
+    let cap = block_tiles_for(count, default_heap_tiles())?;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
     let index = match found {
         Some(index) => index,
         None => {
             let desc = D3D12_HEAP_DESC {
-                SizeInBytes: u64::from(HEAP_TILES) * TILE,
+                SizeInBytes: u64::from(cap) * TILE,
                 Properties: D3D12_HEAP_PROPERTIES {
                     Type: D3D12_HEAP_TYPE_DEFAULT,
                     ..Default::default()
@@ -177,9 +194,10 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             }
             let fresh = Heap {
                 heap: made?,
-                free: vec![(0, HEAP_TILES)],
+                total: cap,
+                free: vec![(0, cap)],
             };
-            STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+            STATS[3].fetch_add(u64::from(cap) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
                 Some(index) => {
                     pool[index] = Some(fresh);
@@ -211,9 +229,9 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
 
 /// Gives the runs `runs` of the pool's heap at `index` back; runs that
 /// touch become one. A heap with every tile free goes back to the card,
-/// unless it is the pool's only one. (Called when the texture that held
-/// the tiles is dropped: nothing on the card reads through its mappings
-/// any more, as for any host texture that is dropped.)
+/// keeping one empty heap only when host memory is calm. (Called when the
+/// texture that held the tiles is dropped: nothing on the card reads
+/// through its mappings any more, as for any host texture that is dropped.)
 fn give_back(index: usize, runs: &[(u32, u32)]) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(h)) = pool.get_mut(index) else {
@@ -229,10 +247,12 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
         }
     }
     h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
+    let total = h.total;
+    let all_free = h.free_tiles() == total;
+    if all_free && (crate::residency::pressured() || pool.iter().flatten().count() > 1) {
+        let bytes = u64::from(total) * TILE;
         pool[index] = None;
-        STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+        STATS[3].fetch_sub(bytes, Ordering::Relaxed);
         STATS[8].fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -310,13 +330,13 @@ impl Tiled {
                 .checked_mul(u32::from(tiling.HeightInTiles))
                 .and_then(|n| n.checked_mul(u32::from(tiling.DepthInTiles)))
                 .unwrap_or(0);
-            if tiles == 0 || tiles > HEAP_TILES || tiling.StartTileIndexInOverallResource == D3D12_PACKED_TILE {
+            if tiles == 0 || tiles > MAX_HEAP_TILES || tiling.StartTileIndexInOverallResource == D3D12_PACKED_TILE {
                 return None;
             }
             standard.push(tiles);
         }
         let packed_tiles = if packed.NumPackedMips > 0 { packed.NumTilesForPackedMips } else { 0 };
-        if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > HEAP_TILES {
+        if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > MAX_HEAP_TILES {
             return None;
         }
         let full = u64::from(total) * TILE;
@@ -1531,7 +1551,7 @@ void look() {
         let Some(host) = host() else {
             return;
         };
-        // A dummy live resource (never mapped because `take()` rejects `HEAP_TILES + 1`).
+        // A dummy live resource (never mapped because `take()` rejects `MAX_HEAP_TILES + 1`).
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -1555,8 +1575,8 @@ void look() {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(TILE, Ordering::Relaxed);
         let mut tiled = Tiled {
-            // Level 0 demands > HEAP_TILES so `take()` fails deterministically.
-            standard: vec![HEAP_TILES + 1, 1],
+            // Level 0 demands > MAX_HEAP_TILES so `take()` fails deterministically.
+            standard: vec![MAX_HEAP_TILES + 1, 1],
             packed: 0,
             levels: 2,
             full: TILE,
@@ -1583,5 +1603,14 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn block_tiles_scale_to_8mib_on_low_vram_and_grow_for_large_levels() {
+        assert_eq!(block_tiles_for(0, LOW_VRAM_HEAP_TILES), None);
+        assert_eq!(block_tiles_for(MAX_HEAP_TILES + 1, LOW_VRAM_HEAP_TILES), None);
+        assert_eq!(block_tiles_for(4, LOW_VRAM_HEAP_TILES), Some(128));
+        assert_eq!(block_tiles_for(200, LOW_VRAM_HEAP_TILES), Some(256));
+        assert_eq!(block_tiles_for(4, MAX_HEAP_TILES), Some(1024));
     }
 }

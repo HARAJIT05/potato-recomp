@@ -103,6 +103,10 @@ fn has_physical_growth_reserve(physical: u64, bake: bool) -> bool {
     physical >= if bake { 256 * MIB } else { 768 * MIB }
 }
 
+fn has_physical_upload_reserve(physical: u64, bake: bool) -> bool {
+    physical >= if bake { 256 * MIB } else { 640 * MIB }
+}
+
 /// Leave commit for game allocations and submissions already in flight while
 /// still letting bindless textures and one-shot material bakes upload.
 pub(crate) fn admit_texture_pass(bake: bool) -> bool {
@@ -115,7 +119,7 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     }
     let commit = sample_commit(now);
     let phys = AVAILABLE_PHYS.load(Ordering::Relaxed);
-    has_upload_reserve(commit, bake) && (bake || phys >= 384 * MIB)
+    has_upload_reserve(commit, bake) && has_physical_upload_reserve(phys, bake)
 }
 
 /// Whether the staging allocator may commit a brand-new OS upload buffer
@@ -262,5 +266,8 @@ mod tests {
         assert!(residency_enabled(Some(OsStr::new("1")), Some(64 * GIB)));
         assert!(!has_physical_growth_reserve(512 * MIB, false));
         assert!(has_physical_growth_reserve(512 * MIB, true));
+        assert!(!has_physical_upload_reserve(512 * MIB, false));
+        assert!(has_physical_upload_reserve(640 * MIB, false));
+        assert!(has_physical_upload_reserve(256 * MIB, true));
     }
 }

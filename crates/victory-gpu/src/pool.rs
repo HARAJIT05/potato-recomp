@@ -85,15 +85,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         SPARES.store(texture_spare_limit(memory, crate::host::keep_freed()), Ordering::Relaxed);
         return;
     }
-    let pressure = crate::residency::pressured();
-    let limit = texture_spare_limit(memory, crate::host::keep_freed() && !pressure);
+    let discrete_spill = crate::host::host().is_some_and(crate::host::Host::is_discrete_low_vram)
+        && memory.is_some_and(|[_, _, _, shared]| shared > (256 << 20));
+    let pressure = crate::residency::pressured() || discrete_spill;
+    let limit = if discrete_spill {
+        0
+    } else {
+        texture_spare_limit(memory, crate::host::keep_freed() && !pressure)
+    };
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
+        let staging_limit = if crate::residency::critical_commit() || discrete_spill {
             0
         } else if pressure {
             1
