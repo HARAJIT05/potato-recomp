@@ -182,24 +182,29 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
 }
 
-/// Texture eviction policy (`(idle_ms, max_bytes)`) accounting for DXGI shared
-/// memory spill on discrete 4-6 GiB cards and system-RAM pressure.
+/// Texture eviction policy (`(idle_ms, max_bytes)`) keeping host textures
+/// resident up to the card's local budget and trimming gently when local VRAM
+/// nears capacity or host RAM headroom is critically low. Note: DXGI's non-local
+/// (`shared`) counter includes host upload/shadow heaps and is not VRAM spill.
 pub(crate) fn texture_eviction_policy(
     budget: u64,
     used: u64,
-    shared_used: u64,
+    _shared_used: u64,
     discrete_low_vram: bool,
     ram_pressured: bool,
 ) -> (u64, u64) {
-    const SPILL_WATCH: u64 = 256 << 20;
-    const SPILL_CRITICAL: u64 = 512 << 20;
-    const HIGH_MS: u64 = 1_000;
-    if ram_pressured || (discrete_low_vram && shared_used > SPILL_CRITICAL) {
-        return (HIGH_MS, u64::MAX);
+    const HIGH_MS: u64 = 2_000;
+    if ram_pressured {
+        let trim = if budget > 0 {
+            used.saturating_sub(budget / 100 * 75).max(64 << 20)
+        } else {
+            u64::MAX
+        };
+        return (HIGH_MS, trim);
     }
-    if discrete_low_vram && shared_used > SPILL_WATCH {
-        let excess = used.saturating_sub(budget / 100 * 75).saturating_add(shared_used - SPILL_WATCH);
-        return (HIGH_MS, excess.max(64 << 20));
+    if discrete_low_vram && budget > 0 && used >= budget / 100 * 90 {
+        let excess = used.saturating_sub(budget / 100 * 82).max(64 << 20);
+        return (HIGH_MS, excess);
     }
     vram_keep(budget, used)
 }
@@ -579,9 +584,8 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     let video = host().and_then(|h| h.video_memory());
-    let discrete_spill = host().is_some_and(Host::is_discrete_low_vram)
-        && video.is_some_and(|[_, _, _, shared]| shared > (256 << 20));
-    if crate::residency::pressured() || discrete_spill {
+    let vram_high = video.is_some_and(|[budget, used, ..]| budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90);
+    if crate::residency::pressured() || vram_high {
         trim_spare_chunks();
     }
     crate::pool::room(video);
@@ -11524,11 +11528,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 11 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 36 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
-        // Discrete <= 6 GiB card spilling > 256 MiB / > 512 MiB to shared RAM, or host RAM pressure:
-        assert_eq!(texture_eviction_policy(3370 * mib, 2000 * mib, 0, true, false).0, 600_000);
-        assert_eq!(texture_eviction_policy(3370 * mib, 3000 * mib, 320 * mib, true, false).0, 1_000);
-        assert_eq!(texture_eviction_policy(3370 * mib, 2000 * mib, 600 * mib, true, false), (1_000, u64::MAX));
-        assert_eq!(texture_eviction_policy(8 * gib, 2 * gib, 0, false, true), (1_000, u64::MAX));
+        // Discrete <= 6 GiB card keeps textures resident until local VRAM >= 90%,
+        // ignores non-local DXGI upload/shadow heap usage, and trims gently under RAM pressure.
+        assert_eq!(texture_eviction_policy(3370 * mib, 2000 * mib, 5300 * mib, true, false).0, 600_000);
+        assert_eq!(texture_eviction_policy(3370 * mib, 3100 * mib, 5300 * mib, true, false).0, 2_000);
+        assert_eq!(texture_eviction_policy(8 * gib, 2 * gib, 0, false, true).0, 2_000);
+        assert_eq!(texture_eviction_policy(0, 2 * gib, 0, false, true), (2_000, u64::MAX));
     }
 
     #[test]

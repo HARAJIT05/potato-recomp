@@ -51,6 +51,9 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Rebuilds the in-scatter marched along rays from its gathered image:
+    /// clamped before it runs, not after ([`clear_march`]).
+    March,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +65,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_ReconstructRaymarchClassified") {
+        Some(Role::March)
     } else {
         None
     }
@@ -75,6 +80,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the reconstructs read the gathered in-scatter (R16G16B16A16_FLOAT,
+/// 180x102 on Series S).
+pub(crate) const MARCH: [(u8, u32); 2] = [(1, 96), (1, 112)];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -109,6 +117,27 @@ fn air() -> f32 {
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
+fn multiple(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+}
+
+/// The most the in-scatter marched along rays holds, as a multiple of the
+/// room's slow mean (`VICTORY_AMBIENT_MARCH=<multiple>`; unset or 0: off).
+pub(crate) fn march() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| multiple(&std::env::var("VICTORY_AMBIENT_MARCH").unwrap_or_default()))
+}
+
+/// How many times the estimate the title's own result may keep
+/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset).
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
     })
 }
 
@@ -346,8 +375,26 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // Zero NaN or infinite froxels so they do not spread along view rays.
+    if (any((asuint(c) & 0x7f800000u) == 0x7f800000u)) { scattered[at] = float3(0.0, 0.0, 0.0); return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
+}
+#endif
+
+#ifdef MARCH
+RWTexture2D<float4> marched : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void clear_march(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    marched.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float4 c = marched[at.xy];
+    if (any((asuint(c.rgb) & 0x7f800000u) == 0x7f800000u)) { marched[at.xy] = float4(0.0, 0.0, 0.0, c.a); return; }
+    float cap = air * dot(cells[CELLS].rgb, LUMA);
+    float has = dot(c.rgb, LUMA);
+    if (has > cap) marched[at.xy] = float4(c.rgb * (cap / has), c.a);
 }
 #endif
 
@@ -458,6 +505,8 @@ const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 /// Where the slow mean is among the cells (float4s).
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
+/// Ring of views for [`clear_march`], long enough to outlive in-flight lists.
+const FILL_VIEWS: u32 = 4096;
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -467,9 +516,12 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    march: Option<(ID3D12PipelineState, ID3D12DescriptorHeap)>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     stats: ID3D12Resource,
+    step: u32,
+    next: std::sync::atomic::AtomicU32,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -499,6 +551,21 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    let march = (march() > 0.0)
+        .then(|| -> windows::core::Result<_> {
+            // SAFETY: plain heap creation.
+            let views = unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: FILL_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?
+            };
+            Ok((pipeline("MARCH", s!("clear_march"))?, views))
+        })
+        .and_then(|made| made.inspect_err(|e| tracing::warn!(error = %e, "no clamp of the marched in-scatter")).ok());
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -508,9 +575,13 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        march,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
         stats: made(256)?,
+        // SAFETY: a plain query.
+        step: unsafe { device.GetDescriptorHandleIncrementSize(kind) },
+        next: std::sync::atomic::AtomicU32::new(0),
     })
 }
 
@@ -571,7 +642,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::March || role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -594,7 +665,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
@@ -626,6 +697,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::March => {}
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
@@ -634,6 +706,87 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
+    }
+    true
+}
+
+/// Holds `image` (the gathered in-scatter a reconstruct is about to read)
+/// to [`march`] times the slow mean's luminance, hue kept. Replaces the list's
+/// view heap, compute root signature and pipeline; false if it recorded nothing.
+pub(crate) fn clear_march(list: &HostList, image: crate::object::This) -> bool {
+    use std::sync::atomic::Ordering;
+    let (Some(pass), Some(host)) = (pass(), host()) else {
+        return false;
+    };
+    let Some((clamp, views)) = &pass.march else {
+        return false;
+    };
+    if !matches!(set(), Set::Estimate(_)) || !KEPT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(texture) = crate::resource::host_resource(image) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.Format.0 != 10
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
+    {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(format = d.Format.0, flags = d.Flags.0, width = d.Width, "marched in-scatter: an image that cannot be clamped");
+        });
+        return false;
+    }
+    let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: d.Format,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 } },
+    };
+    const WRITTEN: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+    const READ: u32 =
+        (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32;
+    crate::list::ensure_state(list, image, WRITTEN);
+    list.keep(texture);
+    list.keep(&pass.cells);
+    list.keep(&pass.points);
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % FILL_VIEWS;
+    let mut words = [0u32; 11];
+    words[10] = march().to_bits();
+    let l = &list.list;
+    uav_barrier(l);
+    // SAFETY: an open list; a slot of our heap; a live texture the list
+    // keeps, in the unordered-access state; buffers the list keeps.
+    unsafe {
+        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: views.GetCPUDescriptorHandleForHeapStart().ptr + (slot * pass.step) as usize,
+        };
+        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: views.GetGPUDescriptorHandleForHeapStart().ptr + u64::from(slot * pass.step),
+        };
+        host.device.CreateUnorderedAccessView(texture, None::<&ID3D12Resource>, Some(&view), cpu);
+        l.SetDescriptorHeaps(&[Some(views.clone())]);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 11, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(2, gpu);
+        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetPipelineState(clamp);
+        l.Dispatch((d.Width as u32).div_ceil(8), d.Height.div_ceil(8), 1);
+    }
+    uav_barrier(l);
+    crate::list::ensure_state(list, image, READ);
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::capture::note_target(image);
+        list.note_op(|| format!("ambient March target={image:p}"));
+    }
+    static TOLD: Mutex<u32> = Mutex::new(0);
+    let mut said = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if *said < 4 {
+        *said += 1;
+        tracing::info!(width = d.Width, height = d.Height, most = march(), "the marched in-scatter is held to the light of the room");
     }
     true
 }
@@ -655,6 +808,11 @@ mod tests {
         assert_eq!(parse_floor("off"), 0.0);
         assert_eq!(parse_floor("0.25"), 0.25);
         assert_eq!(parse_floor("-1"), DEFAULT_FLOOR);
+        assert_eq!(multiple(""), 0.0);
+        assert_eq!(multiple("0"), 0.0);
+        assert_eq!(multiple("-1"), 0.0);
+        assert_eq!(multiple("nan"), 0.0);
+        assert_eq!(multiple(" 1.5 "), 1.5);
     }
 
     #[test]
@@ -662,6 +820,9 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_ReconstructRaymarchClassifiedFull_2d384eab_Wrapped.."), Some(Role::March));
+        assert_eq!(role(b"CS_ReconstructRaymarchClassifiedNoAlpha_2d384eab"), Some(Role::March));
+        assert_eq!(role(b"CS_ReconstructRaymarch_High_66f3d2a0"), None);
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
@@ -672,5 +833,6 @@ mod tests {
             return;
         };
         make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        crate::host::compile(&format!("#define MARCH\n{SOURCE}"), s!("clear_march"), s!("cs_5_1")).expect("the march clamp");
     }
 }

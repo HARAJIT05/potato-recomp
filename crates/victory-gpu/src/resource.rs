@@ -1299,7 +1299,7 @@ fn video_memory_percent() -> u64 {
 fn auto_texture_max(pct: u64, discrete_low_vram: bool) -> u64 {
     if discrete_low_vram {
         match pct {
-            0..70 => 512,
+            0..85 => 512,
             _ => 256,
         }
     } else {
@@ -1601,6 +1601,107 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Of `n` levels, how many a texture `longer` texels long can give up and
+/// stay at least `keep` texels long (`keep` 0: all `n`).
+fn levels_above(n: u32, longer: u64, keep: u64) -> u32 {
+    match keep {
+        0 => n,
+        keep => n.min((longer / keep).checked_ilog2().unwrap_or(0)),
+    }
+}
+
+/// How many of its largest levels the host copy of a texture described by
+/// `desc` leaves out (`VICTORY_TEXTURE_DROP_MIPS=N`, at most 4; 0, the
+/// default, leaves out none). Bounded by `VICTORY_TEXTURE_KEEP_SIDE` so no
+/// side drops below that texel length.
+#[cfg(windows)]
+pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(4)
+    });
+    if n == 0
+        || !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.sample_count > 1
+        || desc.mip_levels < 5
+    {
+        return 0;
+    }
+    static KEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let keep = *KEEP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_KEEP_SIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let n = levels_above(n.min(u32::from(desc.mip_levels).saturating_sub(1)), w.max(h), keep);
+    let whole = |side: u64| side.is_multiple_of(4 << n);
+    if n == 0 || w.min(h) < 512 || !whole(w) || !whole(h) {
+        return 0;
+    }
+    n
+}
+
+/// Levels omitted at the top of `this`'s host copy; 0 for buffers and null.
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    made_copy(this).map_or_else(|| drop_levels(&resource(this).desc), |copy| copy.base)
+}
+
+/// Host copy subresource for title subresource `index`; `None` if omitted.
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let drop = dropped(this);
+    let mips = u32::from(resource(this).desc.mip_levels).max(1);
+    let (mip, slice) = (index % mips, index / mips);
+    (mip >= drop).then(|| mip - drop + slice * (mips - drop))
+}
+
+/// Subresources in the first plane of `this` (levels times slices).
+#[cfg(windows)]
+pub(crate) fn title_subresources(this: This) -> u32 {
+    let desc = &resource(this).desc;
+    u32::from(desc.mip_levels).max(1) * u32::from(desc.depth_or_array_size).max(1)
+}
+
+/// Maps a readback subresource before host copies exist.
+#[cfg(windows)]
+pub(crate) fn readback_subresource(this: This, index: u32) -> Result<u32, &'static str> {
+    if dropped(this) == 0 {
+        return Ok(index);
+    }
+    let desc = &resource(this).desc;
+    if index >= u32::from(desc.mip_levels) * u32::from(desc.depth_or_array_size) {
+        return Err("a read back outside the first plane of the host texture");
+    }
+    host_subresource(this, index).ok_or("a mip level omitted from the host texture")
+}
+
+/// Shifts a shader view's mip range down by `drop` omitted levels.
+#[cfg(test)]
+pub(crate) fn shift_levels(drop: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
+    if drop == 0 {
+        return;
+    }
+    if *levels != u32::MAX {
+        let end = first.saturating_add(*levels);
+        *levels = end.saturating_sub(drop.max(*first)).max(1);
+    }
+    *first = first.saturating_sub(drop);
+    *clamp = (*clamp - drop as f32).max(0.0);
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1655,7 +1756,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() && drop_levels(&r.desc) == 0 {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1680,15 +1781,16 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
-        let mut base = 0;
+        let mut base = drop_levels(&r.desc);
         let mut prefill = None;
         if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            base = base.max(base_level(&r.desc, if first == u32::MAX { 0 } else { first }));
             // The store has its larger levels: made whole at once.
             if over_cap(&r.desc) == 0
+                && drop_levels(&r.desc) == 0
                 && base > 0
                 && tiled.is_none()
                 && let Some(found) = stored_levels(r, first)
@@ -1779,14 +1881,9 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 }
 
 #[cfg(any(windows, test))]
-fn room_used_limit_bytes(budget: u64, dedicated: Option<u64>, room_percent: u64) -> u64 {
-    const LOW_VRAM: u64 = 6 << 30;
+fn room_used_limit_bytes(budget: u64, _dedicated: Option<u64>, room_percent: u64) -> u64 {
     let pct = room_percent.clamp(50, 97);
-    let by_budget = budget / 100 * pct;
-    match dedicated {
-        Some(phys) if phys > 0 && phys <= LOW_VRAM => by_budget.max(phys / 100 * pct),
-        _ => by_budget,
-    }
+    budget / 100 * pct
 }
 
 #[cfg(all(test, any(windows, not(windows))))]
@@ -1797,9 +1894,9 @@ mod low_vram_room_tests {
     const GIB: u64 = 1 << 30;
 
     #[test]
-    fn low_vram_discrete_uses_dedicated_share_without_hurting_igpu_or_8gb() {
+    fn low_vram_uses_live_budget_without_hurting_igpu_or_8gb() {
         let rtx3050_budget = 3370 * MIB;
-        assert_eq!(room_used_limit_bytes(rtx3050_budget, Some(4 * GIB), 95), (4 * GIB) / 100 * 95);
+        assert_eq!(room_used_limit_bytes(rtx3050_budget, Some(4 * GIB), 90), rtx3050_budget / 100 * 90);
         assert_eq!(room_used_limit_bytes(rtx3050_budget, None, 95), rtx3050_budget / 100 * 95);
         assert_eq!(room_used_limit_bytes(6 * GIB, Some(512 * MIB), 90), (6 * GIB) / 100 * 90);
         let rtx_8gb_budget = 7200 * MIB;
@@ -1807,20 +1904,22 @@ mod low_vram_room_tests {
     }
 
     #[test]
-    fn shared_spill_and_host_pressure_stop_texture_admission_even_below_floor() {
+    fn non_local_heaps_do_not_starve_texture_admission_on_4gb() {
         let budget = 3370 * MIB;
         let dedicated = Some(3965 * MIB);
-        // Calm: below floor admits.
-        assert!(room_admits(Some([budget, 1800 * MIB, 7212 * MIB, 0]), 200 * MIB, 0, 1280 * MIB, dedicated, 75, false));
-        // Discrete PCIe spill > 256 MiB stops new textures even when `filled < floor`.
-        assert!(!room_admits(Some([budget, 3200 * MIB, 7212 * MIB, 300 * MIB]), 200 * MIB, 0, 0, dedicated, 75, false));
-        // Host RAM/commit pressure also stops admission.
-        assert!(!room_admits(Some([budget, 1800 * MIB, 7212 * MIB, 0]), 200 * MIB, 0, 0, dedicated, 75, true));
-        // iGPU uses shared memory normally and is not blocked by discrete-GPU spill cutoffs.
+        // DXGI non-local (`shared`) usage counts host upload/shadow heaps (~5.3 GiB)
+        // and must not block local VRAM texture admission while local usage has room.
+        assert!(room_admits(Some([budget, 2000 * MIB, 7212 * MIB, 5300 * MIB]), 200 * MIB, 0, 100 * MIB, dedicated, 90, false));
+        assert!(room_admits(Some([budget, 2000 * MIB, 7212 * MIB, 5300 * MIB]), 1200 * MIB, 0, 0, dedicated, 90, false));
+        // Once past the floor, local used + kept over limit stops admission.
+        assert!(!room_admits(Some([budget, 3200 * MIB, 7212 * MIB, 0]), 1200 * MIB, 0, 0, dedicated, 90, false));
+        // Host critical pressure stops admission.
+        assert!(!room_admits(Some([budget, 1800 * MIB, 7212 * MIB, 0]), 200 * MIB, 0, 0, dedicated, 90, true));
+        // iGPU uses shared memory normally.
         assert!(room_admits(Some([6 * GIB, 2 * GIB, 8 * GIB, 1024 * MIB]), 200 * MIB, 0, 0, Some(512 * MIB), 90, false));
-        // Auto texture cap lowers earlier on <= 6 GiB discrete GPUs.
-        assert_eq!(auto_texture_max(50, true), 512);
-        assert_eq!(auto_texture_max(75, true), 256);
+        // Auto texture cap stays 512 until 85% of budget on <= 6 GiB discrete GPUs.
+        assert_eq!(auto_texture_max(75, true), 512);
+        assert_eq!(auto_texture_max(86, true), 256);
         assert_eq!(auto_texture_max(75, false), 1024);
     }
 }
@@ -1836,38 +1935,17 @@ fn room_admits(
     host_constrained: bool,
 ) -> bool {
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    const SPILL_CUTOFF: u64 = 256 << 20;
-    const SPILL_SOFT: u64 = 128 << 20;
     if host_constrained {
         return false;
     }
-    let discrete_low_vram = dedicated.is_some_and(|d| d > 512 * MIB && d <= 6 * GIB);
     match memory {
-        Some([budget, used, _, shared_used]) => {
-            if discrete_low_vram && shared_used > SPILL_CUTOFF {
-                return false;
-            }
+        Some([budget, used, ..]) => {
             let floor = texture_floor_bytes(Some(budget));
             if filled < floor {
                 return true;
             }
             let limit = room_used_limit_bytes(budget, dedicated, room_percent);
-            let effective_limit = if discrete_low_vram && shared_used > SPILL_SOFT {
-                limit.min(budget)
-            } else {
-                limit
-            };
-            let spill_penalty = if discrete_low_vram {
-                shared_used.saturating_sub(SPILL_SOFT)
-            } else {
-                0
-            };
-            used.saturating_sub(pool_room)
-                .saturating_add(kept)
-                .saturating_add(spill_penalty)
-                < effective_limit
+            used.saturating_sub(pool_room).saturating_add(kept) < limit
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1898,7 +1976,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     };
     let dedicated = crate::host::host().and_then(|h| h.dedicated_video_memory());
     let host_constrained = crate::residency::critical_commit()
-        || crate::host::available_physical_ram().is_some_and(|p| p < (1 << 30));
+        || crate::host::available_physical_ram().is_some_and(|p| p < (512 << 20));
     room_admits(
         Some(memory),
         filled,
@@ -1935,7 +2013,16 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                || {
+                    if crate::host::host().is_some_and(crate::host::Host::is_discrete_low_vram) {
+                        1350 << 20
+                    } else {
+                        3072 << 20
+                    }
+                },
+                |mb| mb.min(8192) << 20,
+            )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -2239,8 +2326,8 @@ pub(crate) fn let_go_idle() {
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
     let discrete_low_vram = crate::host::host().is_some_and(crate::host::Host::is_discrete_low_vram);
-    let ram_pressured = crate::residency::pressured()
-        || crate::host::available_physical_ram().is_some_and(|p| p < (2 << 30));
+    let ram_pressured = crate::residency::critical_commit()
+        || crate::host::available_physical_ram().is_some_and(|p| p < (512 << 20));
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
@@ -2251,9 +2338,14 @@ pub(crate) fn let_go_idle() {
                 + targets_room_kept();
             crate::host::texture_eviction_policy(budget, used, shared_used, discrete_low_vram, ram_pressured)
         }
-        Some([_, _, _, shared_used]) if (discrete_low_vram && shared_used > (256 << 20)) || ram_pressured => {
-            (1_000, u64::MAX)
-        }
+        Some([budget, used, ..]) if ram_pressured => (
+            2_000,
+            if budget > 0 {
+                used.saturating_sub(budget / 100 * 75).max(64 << 20)
+            } else {
+                u64::MAX
+            },
+        ),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,
@@ -3535,6 +3627,32 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    #[test]
+    fn views_shift_down_by_the_levels_left_out() {
+        let shifted = |drop, first, levels, clamp| {
+            let (mut f, mut l, mut c) = (first, levels, clamp);
+            shift_levels(drop, &mut f, &mut l, &mut c);
+            (f, l, c)
+        };
+        assert_eq!(shifted(1, 0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        assert_eq!(shifted(1, 0, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(1, 0, 10, 0.0), (0, 9, 0.0));
+        assert_eq!(shifted(1, 3, 2, 2.5), (2, 2, 1.5));
+        assert_eq!(shifted(2, 1, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(0, 3, 2, 1.0), (3, 2, 1.0));
+    }
+
+    #[test]
+    fn a_kept_side_bounds_the_levels_dropped() {
+        assert_eq!(levels_above(2, 4096, 0), 2);
+        assert_eq!(levels_above(2, 4096, 1024), 2);
+        assert_eq!(levels_above(2, 2048, 1024), 1);
+        assert_eq!(levels_above(2, 1024, 1024), 0);
+        assert_eq!(levels_above(2, 512, 1024), 0);
+        assert_eq!(levels_above(4, 8192, 1024), 3);
+        assert_eq!(levels_above(1, 3000, 1024), 1);
     }
 
     type Release = extern "system" fn(This) -> u32;

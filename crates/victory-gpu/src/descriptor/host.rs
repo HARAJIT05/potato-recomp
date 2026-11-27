@@ -1094,6 +1094,24 @@ impl TextureQueue {
         self.take_out(index);
     }
 
+    /// Of the slots `indices`, those waiting for upload (due or not, held or not),
+    /// with their write numbers (`crate::draw::State::bake_sources_pass`).
+    fn queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        indices
+            .iter()
+            .filter_map(|&index| self.slots.get(&index).filter(|w| w.checked.2 == 0).map(|w| (index, w.write)))
+            .collect()
+    }
+
+    /// Re-queues `indices` as due in `frame` unless already waiting for upload.
+    fn requeue(&mut self, indices: &[u32], frame: u64) {
+        for &index in indices {
+            if self.slots.get(&index).is_none_or(|w| w.checked.2 != 0) {
+                self.written(index, frame, frame, false);
+            }
+        }
+    }
+
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
     /// - first the ones looked at before (their memory was not mapped, or
@@ -1957,6 +1975,16 @@ impl HostHeap {
             (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
         };
         (TextureQueue::in_order(due, max), census)
+    }
+
+    /// See [`TextureQueue::requeue`].
+    pub(crate) fn texture_slots_requeue(&self, indices: &[u32], frame: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).requeue(indices, frame);
+    }
+
+    /// See [`TextureQueue::queued`].
+    pub(crate) fn texture_slots_queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).queued(indices)
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -4611,6 +4639,16 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u3
             let t = unsafe { &mut desc.Anonymous.Texture2DArray };
             clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
         }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
         _ => {}
     }
 }
@@ -5133,6 +5171,18 @@ mod tests {
         assert_eq!(full.count, 2047);
     }
 
+    #[test]
+    fn shortened_view_mip_range_fits_the_host_texture() {
+        let mut desc = srv_desc(&[98, 4, 5768, 0, 4, 5, 0, 0, 0, 0]);
+        from_base(&mut desc, 1, 7);
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (3, 4));
+        let mut desc = srv_desc(&[98, 4, 5768, 0, 99, u32::MAX, 0, 0, 0, 0]);
+        from_base(&mut desc, 0, 7);
+        let t = unsafe { desc.Anonymous.Texture2D };
+        assert_eq!((t.MostDetailedMip, t.MipLevels), (6, u32::MAX));
+    }
+
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
     #[test]
@@ -5638,6 +5688,30 @@ mod tests {
             // SAFETY: a live buffer.
             assert_eq!(width(&v), unsafe { copy.buffer.GetDesc() }.Width);
         }
+    }
+
+    #[test]
+    fn slots_a_draw_names_are_handed_out_whatever_their_turn() {
+        let mut q = TextureQueue::default();
+        q.written(5, 1, 0, false);
+        q.written(6, 1, 50, false);
+        q.written(7, 1, 0, false);
+        let due = q.due(1, 100);
+        let write = |index: u32| due.iter().find(|d| d.0 == index).map(|d| d.1).unwrap();
+        assert!(!due.iter().any(|d| d.0 == 6), "slot 6 is not due before frame 50");
+        q.hold(7, write(7), 101);
+        let named = |q: &TextureQueue| -> Vec<u32> { q.queued(&[5, 6, 7, 8]).into_iter().map(|d| d.0).collect() };
+        assert_eq!(named(&q), [5, 6, 7]);
+        assert_eq!(q.queued(&[7]), [(7, write(7))]);
+        q.recheck(5, write(5), 9, (0x1000, 0x100), 1234, 0, 1);
+        assert_eq!(named(&q), [6, 7]);
+        let six = q.queued(&[6]);
+        q.requeue(&[5, 6, 8], 3);
+        assert_eq!(named(&q), [5, 6, 7, 8]);
+        assert_eq!(q.checked(5), None);
+        assert_eq!(q.queued(&[6]), six, "slot 6 waited already: as it was");
+        let now: Vec<u32> = q.due(3, 100).into_iter().map(|d| d.0).collect();
+        assert!(now.contains(&5) && now.contains(&8) && !now.contains(&6) && !now.contains(&7));
     }
 
     /// The queue of textures picked by index serves the slots looked at
