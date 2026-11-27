@@ -22,7 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -56,31 +56,6 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn code_uses_bvh_trace(code: &[u8]) -> bool {
-    victory_shader::gfx10::decode(code).is_ok_and(|insts| {
-        insts
-            .iter()
-            .any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh")))
-    })
-}
-
-fn uses_bvh_trace(shaders: &[Arc<Shader>]) -> bool {
-    shaders.iter().any(|s| {
-        s.stage == "compute"
-            && victory_shader::Container::parse(&s.container)
-                .ok()
-                .and_then(|c| {
-                    let part = c.part(victory_shader::FourCC::DXIL)?;
-                    victory_shader::native_programs(part.data).ok()
-                })
-                .is_some_and(|programs| programs.iter().any(|p| code_uses_bvh_trace(&p.code)))
-    })
-}
-
-fn rt_trace_disabled(builder: bool, setting: Option<&std::ffi::OsStr>) -> bool {
-    !builder && setting.is_some_and(|v| v == "0")
-}
-
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
@@ -105,17 +80,6 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
-    }
-    static SKIP_RT_TRACE: OnceLock<bool> = OnceLock::new();
-    let skip_trace = *SKIP_RT_TRACE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        rt_trace_disabled(builder, std::env::var_os("VICTORY_RT_TRACE").as_deref())
-    });
-    if skip_trace
-        && !named(shaders, b"CS_ScreenProbes_TemporalResolve")
-        && uses_bvh_trace(shaders)
-    {
-        return Some("traces a ray-tracing BVH without BVH, left out");
     }
     None
 }
@@ -174,15 +138,252 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
-            let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            made
-        });
+        // Not through `OnceLock::get_or_init`: a worker the driver's compiler
+        // crashed under stays inside the call for good (see [`guard_start`]),
+        // and anyone else asking would wait for it forever.
+        if self.made.get().is_none() {
+            let made = if is_bad_key(&self.key) {
+                SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before");
+                None
+            } else {
+                let _building = crate::timeline::span("pipeline: build a host pipeline");
+                let began = Instant::now();
+                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+                made
+            };
+            let _ = self.made.set(made);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+/// Pipelines not made for being on the list of those the driver's compiler
+/// crashes on.
+static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
+
+/// The keys of the pipelines the driver's compiler crashed or hung on
+/// (`warm-bad.txt` beside the pipeline library). Recorded entries use
+/// `<key> fp=<fingerprint> ...` so older binaries still see the key in
+/// column one while driver or translator changes retry them automatically;
+/// bare `<key> ...` lines remain compatible and `#` begins a comment.
+/// Loaded on first use; `VICTORY_WARM_BAD=0` leaves the file unread.
+static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+    let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = keys.get_or_insert_with(|| {
+        if super::known::bad_list_disabled() {
+            return Default::default();
+        }
+        let listed = super::library::folder()
+            .and_then(|d| std::fs::read_to_string(d.join(super::known::WARM_BAD_FILE)).ok())
+            .unwrap_or_default();
+        if listed.is_empty() {
+            return Default::default();
+        }
+        super::known::parse_bad_keys(&listed, &super::known::fingerprint())
+    });
+    f(keys)
+}
+
+fn is_bad_key(key: &str) -> bool {
+    bad_keys(|keys| keys.contains(key))
+}
+
+/// Whether the driver's compiler crashes are caught
+/// (`VICTORY_COMPILER_GUARD=0`: not).
+fn guard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPILER_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// Worker threads that can be told apart by the guard, over the run.
+const MAX_SLOTS: usize = 128;
+/// Per worker slot: its compile crashed (set in the handler), where.
+static CRASHED: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
+static FAULT_ADDR: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static FAULT_RIP: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+/// The event the handler signals (a Win32 handle).
+static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
+/// What each slot's worker is making, and whether it takes passes over the
+/// screen alone. Never locked by the handler.
+static ACTIVE_JOBS: Mutex<Vec<Option<(Arc<Pending>, bool)>>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// This worker's slot (`usize::MAX`: none).
+    static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// Whether this thread is inside the compile of a pipeline.
+    static COMPILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A worker's compile of `p`: noted for the guard while it lasts.
+struct Compile {
+    slot: usize,
+}
+
+impl Compile {
+    fn begin(slot: usize, p: &Arc<Pending>, screens_only: bool) -> Compile {
+        if slot < MAX_SLOTS && guard_on() {
+            let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if jobs.len() < MAX_SLOTS {
+                jobs.resize(MAX_SLOTS, None);
+            }
+            jobs[slot] = Some((p.clone(), screens_only));
+            COMPILING.set(true);
+        }
+        Compile { slot }
+    }
+}
+
+impl Drop for Compile {
+    fn drop(&mut self) {
+        if COMPILING.replace(false) && self.slot < MAX_SLOTS {
+            let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(job) = jobs.get_mut(self.slot) {
+                *job = None;
+            }
+        }
+    }
+}
+
+/// Installs the handler for the driver's compiler crashing (AMD's does on an
+/// RX 9070 XT, and not on the same pipelines in every run: an access of the
+/// first pages in `amdxc64.dll`) and the thread that deals with what it
+/// left. The handler does the least there is: it notes where, signals, and
+/// leaves the worker asleep for good. No allocation, no lock, no file: the
+/// crash may have been under any of them. The watcher puts the pipeline on
+/// the list of those left out (`warm-bad.txt`), says it is not made, gives
+/// the worker's place in the counts back and starts another worker.
+fn guard_start() {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if !guard_on() {
+        return;
+    }
+    ONCE.call_once(|| {
+        // SAFETY: an unnamed auto-reset event, no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if event.is_null() {
+            tracing::warn!("no event for the driver's compiler crashes: they are not caught");
+            return;
+        }
+        CRASH_EVENT.store(event as usize, Ordering::Release);
+        let spawned = std::thread::Builder::new().name("victory-pipeline-watch".into()).spawn(watch);
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no thread for the driver's compiler crashes: they are not caught");
+            return;
+        }
+        // SAFETY: a handler that lives as long as the process.
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        }
+        tracing::info!("the driver's compiler crashing on a worker is caught (VICTORY_COMPILER_GUARD=0: not)");
+    });
+}
+
+/// The handler: a worker inside a compile read or wrote one of the first
+/// pages. See [`guard_start`].
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::System::Threading::{SetEvent, Sleep};
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    const CONTINUE_SEARCH: i32 = 0;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != ACCESS_VIOLATION || record.NumberParameters < 2 || record.ExceptionInformation[1] >= 0x10000 {
+        return CONTINUE_SEARCH;
+    }
+    if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
+        return CONTINUE_SEARCH;
+    }
+    let slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
+    if slot >= MAX_SLOTS {
+        return CONTINUE_SEARCH;
+    }
+    let _ = COMPILING.try_with(|c| c.set(false));
+    FAULT_ADDR[slot].store(record.ExceptionInformation[1] as u64, Ordering::Relaxed);
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the system passes a live context.
+    FAULT_RIP[slot].store(unsafe { (*(*info).ContextRecord).Rip }, Ordering::Relaxed);
+    CRASHED[slot].store(true, Ordering::Release);
+    let event = CRASH_EVENT.load(Ordering::Acquire);
+    if event != 0 {
+        // SAFETY: the event lives as long as the process.
+        unsafe { SetEvent(event as windows_sys::Win32::Foundation::HANDLE) };
+    }
+    loop {
+        // SAFETY: a plain sleep.
+        unsafe { Sleep(u32::MAX - 1) };
+    }
+}
+
+/// The thread that deals with the workers the compiler crashed under.
+fn watch() {
+    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    loop {
+        let event = CRASH_EVENT.load(Ordering::Acquire);
+        // SAFETY: the event lives as long as the process.
+        unsafe { WaitForSingleObject(event as windows_sys::Win32::Foundation::HANDLE, INFINITE) };
+        for slot in 0..MAX_SLOTS {
+            if CRASHED[slot].swap(false, Ordering::AcqRel) {
+                lost(slot);
+            }
+        }
+    }
+}
+
+/// The worker at `slot` is gone with the pipeline it was making.
+fn lost(slot: usize) {
+    let job = {
+        let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.get_mut(slot).and_then(Option::take)
+    };
+    let Some((p, screens_only)) = job else {
+        return;
+    };
+    tracing::error!(
+        key = p.key,
+        shaders = ?p.shaders,
+        rip = format_args!("{:#x}", FAULT_RIP[slot].load(Ordering::Relaxed)),
+        address = format_args!("{:#x}", FAULT_ADDR[slot].load(Ordering::Relaxed)),
+        "the driver's compiler crashed making a pipeline: it is left out, the worker is replaced"
+    );
+    let known = bad_keys(|keys| !keys.insert(p.key.clone()));
+    if !known && let Some(dir) = super::library::folder() {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(super::known::WARM_BAD_FILE));
+        if let Ok(mut f) = file {
+            let fingerprint = super::known::fingerprint();
+            let reason = format!("ended the compiler in a run: {:?}", p.shaders);
+            let _ = writeln!(f, "{}", super::known::format_bad_entry(&p.key, &fingerprint, &reason));
+        }
+    }
+    let _ = p.made.set(None);
+    if p.was_slow.swap(false, Ordering::Relaxed) {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.slow_now = queue.slow_now.saturating_sub(1);
+        AVAILABLE.notify_all();
+    }
+    {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    }
+    if !spawn_worker(screens_only) {
+        tracing::warn!("no worker to take the place of the one the compiler crashed under");
     }
 }
 
@@ -337,6 +538,7 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,6 +551,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    waiting.end();
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -522,7 +725,7 @@ fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) 
     }
 }
 
-/// Starts the workers ([`worker_count`]) on first use.
+/// Starts the workers ([`worker_count_for`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
@@ -536,44 +739,60 @@ fn workers() -> bool {
         );
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
+        guard_start();
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
-                    loop {
-                        let p = next(screens_only);
-                        p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
-                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
-                        }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
+            if spawn_worker(i >= workers) {
                 running = true;
             }
         }
         running
     })
+}
+
+/// Starts one worker: one for passes over the screen alone, or one of the
+/// others.
+fn spawn_worker(screens_only: bool) -> bool {
+    let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{slot}"))
+        .spawn(move || {
+            WORKER_SLOT.set(slot);
+            // Below the title's own threads (loading, recording),
+            // and the streaming one, which is below normal itself
+            // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+            let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                let _ = SetThreadPriority(GetCurrentThread(), priority);
+            }
+            loop {
+                let p = next(screens_only);
+                {
+                    // (If the compiler crashes in here this thread never
+                    // returns: `lost` does what follows for it.)
+                    let _compile = Compile::begin(slot, &p, screens_only);
+                    p.make();
+                }
+                if p.was_slow.load(Ordering::Relaxed) {
+                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.slow_now -= 1;
+                    AVAILABLE.notify_all();
+                }
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+        false
+    } else {
+        true
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -631,6 +850,18 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline the compiler crashed on is not made again: no compile.
+    #[test]
+    fn a_pipeline_on_the_bad_list_is_not_compiled() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "bad-pipeline-test".to_owned();
+        bad_keys(|keys| keys.insert(p.key.clone()));
+        let before = SKIPPED_BAD.load(Ordering::Relaxed);
+        p.make();
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(SKIPPED_BAD.load(Ordering::Relaxed) > before);
     }
 
     #[test]
@@ -706,23 +937,5 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
-    }
-
-    #[test]
-    fn skips_bvh_trace_compute_shaders_without_bvh_builder() {
-        let bvh_code: Vec<u8> = [0xF198_0001u32, 0x0000_0000, 0xBF81_0000]
-            .into_iter()
-            .flat_map(u32::to_le_bytes)
-            .collect();
-        let plain_code: Vec<u8> = [0xBF81_0000u32].into_iter().flat_map(u32::to_le_bytes).collect();
-        assert!(super::code_uses_bvh_trace(&bvh_code));
-        assert!(!super::code_uses_bvh_trace(&plain_code));
-
-        use std::ffi::OsStr;
-        assert!(!super::rt_trace_disabled(false, None));
-        assert!(super::rt_trace_disabled(false, Some(OsStr::new("0"))));
-        assert!(!super::rt_trace_disabled(false, Some(OsStr::new("1"))));
-        assert!(!super::rt_trace_disabled(true, None));
-        assert!(!super::rt_trace_disabled(true, Some(OsStr::new("0"))));
     }
 }

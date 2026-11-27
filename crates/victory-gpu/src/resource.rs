@@ -100,7 +100,13 @@ pub(crate) struct ResourceDesc {
 
 #[cfg(windows)]
 impl ResourceDesc {
+    /// Width, height, format and levels (`crate::texstore`).
+    pub(crate) fn shape(&self) -> [u32; 4] {
+        [self.width as u32, self.height, self.format, u32::from(self.mip_levels)]
+    }
+
     /// The texture of this one's levels from `base` on.
+    #[allow(clippy::wrong_self_convention)]
     fn from_level(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
@@ -534,7 +540,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = shared_twin_scratch(host, bytes) else {
+        let Some(buffer) = host.uav_buffer(bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
@@ -586,34 +592,6 @@ fn twin_texture(
         through,
         plane,
     }))
-}
-
-#[cfg(windows)]
-struct TwinScratch(Vec<(u64, windows::Win32::Graphics::Direct3D12::ID3D12Resource)>);
-
-// SAFETY: D3D12 resources are free-threaded.
-#[cfg(windows)]
-unsafe impl Send for TwinScratch {}
-
-#[cfg(windows)]
-static TWIN_SCRATCH: std::sync::Mutex<TwinScratch> = std::sync::Mutex::new(TwinScratch(Vec::new()));
-
-/// Shared scratch buffer of at least `size` bytes (rounded up to a power of
-/// two) for copying between depth textures and their stencil twins (`Marvisak #2162`).
-#[cfg(windows)]
-fn shared_twin_scratch(
-    host: &crate::host::Host,
-    size: u64,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    let class = size.max(1 << 16).next_power_of_two();
-    let mut all = TWIN_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
-        return Some(buffer.clone());
-    }
-    let buffer = host.uav_buffer(class)?;
-    crate::host::name(&buffer, || format!("depth twin copies {class:#x}"));
-    all.0.push((class, buffer.clone()));
-    Some(buffer)
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -1207,6 +1185,11 @@ pub(crate) struct HostTexture {
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
+    /// Made whole from the store (`crate::texstore`): its levels below the
+    /// first one title memory holds, until a list copies them; then how
+    /// many levels the copy put in (its views show them).
+    pub(crate) prefill: std::sync::Mutex<Option<(u32, std::sync::Arc<Vec<u8>>)>>,
+    pub(crate) prefilled: std::sync::atomic::AtomicU32,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -1293,12 +1276,62 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// The share of the card's local VRAM budget in use, in percent (cached for
+/// a tenth of a second via [`crate::host::now_ms`]).
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 8 == tenth {
+        return last & 0xff;
+    }
+    let pct = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .and_then(|[budget, used, ..]| (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64))
+        .unwrap_or(0);
+    LAST.store((tenth << 8) | pct, Relaxed);
+    pct
+}
+
+/// How many of a streamed placed 2D texture's largest mips to skip so no side
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
+/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
+/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if set == Some(0) {
+        return 0;
+    }
+    let max = set.unwrap_or_else(|| match video_memory_percent() {
+        0..92 => 1024,
+        92..97 => 512,
+        _ => 256,
+    });
+    let mut skip = 0u32;
+    while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
+        if skip + 1 >= u32::from(desc.mip_levels) {
+            break;
+        }
+        skip += 1;
+    }
+    skip
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`]; block-compressed
-/// formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1356,6 +1389,31 @@ pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
 #[cfg(windows)]
 static REPLACED: std::sync::Mutex<Vec<(u64, Made)>> = std::sync::Mutex::new(Vec::new());
 
+/// The larger levels of placed texture `r`, first viewed from level
+/// `first`, if the store has them (`crate::texstore`): the level the title's
+/// memory is read from, and the levels below it as the host lays them out.
+#[cfg(windows)]
+fn stored_levels(r: &Resource, first: u32) -> Option<(u32, std::sync::Arc<Vec<u8>>)> {
+    if !crate::texstore::on() || r.desc.depth_or_array_size != 1 || r.desc.sample_count > 1 {
+        return None;
+    }
+    let t = texture_layout(&r.desc).filter(|t| t.planes.len() == 1)?;
+    let layout = &t.planes[0].layout;
+    if layout.desc.swizzle.xor() {
+        return None;
+    }
+    let level = read_from(layout, first);
+    let len = crate::texstore::key_levels(layout, u32::from(r.desc.mip_levels))
+        .into_iter()
+        .find(|&(k, _)| k == level)?
+        .1 as usize;
+    let mut smaller = vec![0u8; len];
+    if crate::host::read_there(r.data().cast_const(), &mut smaller) != len {
+        return None;
+    }
+    crate::texstore::find(r.desc.shape(), level, &smaller).map(|bytes| (level, bytes))
+}
+
 /// Since the start: host copies made with a first level other than the
 /// title's, and their bytes; host copies replaced by one with more levels;
 /// bytes of title memory such copies' textures take whole.
@@ -1375,6 +1433,9 @@ pub(crate) fn want_level(this: This, first: u32) {
     let r = resource(this);
     if r.desc.dimension == BUFFER || !r.host.placed.load(Relaxed) {
         return;
+    }
+    if r.desc.mip_levels > 1 {
+        crate::texlate::viewed(this as usize, first);
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     let Some((host, _)) = made.as_ref() else {
@@ -1605,12 +1666,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        let mut prefill = None;
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            // The store has its larger levels: made whole at once.
+            if over_cap(&r.desc) == 0
+                && base > 0
+                && tiled.is_none()
+                && let Some(found) = stored_levels(r, first)
+            {
+                base = 0;
+                prefill = Some(found);
             }
         }
         let texture = match texture {
@@ -1639,6 +1708,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        *host.prefill.get_mut().unwrap_or_else(|e| e.into_inner()) = prefill;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -1693,20 +1763,6 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
-/// Local VRAM ceiling used by [`room`] when deciding whether new host
-/// texture copies may still be created.
-///
-/// On GPUs with `<= 6 GiB` of dedicated VRAM, Windows DWM frequently reports
-/// an OS `budget` well below physical VRAM (for example ~`3,370 MiB` on a
-/// `4,096 MiB` card). Using `budget * room_percent%` alone (~`3,201 MiB`)
-/// starves active world scenes whose render targets + textures need
-/// `3.5–3.8 GiB`, while an un-capped `VICTORY_TEXTURE_BUDGET_MB` overflows
-/// physical VRAM into `DXGI_ERROR_DEVICE_REMOVED`. Allowing up to
-/// `dedicated * room_percent%` on `<= 6 GiB` discrete GPUs (never below
-/// `budget * room_percent%`, so iGPUs with small dedicated carveouts are
-/// unaffected) gives scenes room while still capping total `used` safely below
-/// physical VRAM, and [`let_go_idle`] continues trimming idle textures against
-/// the DXGI `budget`.
 #[cfg(any(windows, test))]
 fn room_used_limit_bytes(budget: u64, dedicated: Option<u64>, room_percent: u64) -> u64 {
     const LOW_VRAM: u64 = 6 << 30;
@@ -1727,15 +1783,10 @@ mod low_vram_room_tests {
 
     #[test]
     fn low_vram_discrete_uses_dedicated_share_without_hurting_igpu_or_8gb() {
-        // 4 GiB discrete GPU where Windows reserves ~726 MiB (budget = 3370 MiB):
-        // room allows up to 95% of 4 GiB (3891 MiB) instead of starving at 3201 MiB.
         let rtx3050_budget = 3370 * MIB;
         assert_eq!(room_used_limit_bytes(rtx3050_budget, Some(4 * GIB), 95), (4 * GIB) / 100 * 95);
-        // Unknown adapter falls back to budget share.
         assert_eq!(room_used_limit_bytes(rtx3050_budget, None, 95), rtx3050_budget / 100 * 95);
-        // iGPU with small carveout (512 MiB dedicated, 6 GiB budget) never shrinks below budget share.
         assert_eq!(room_used_limit_bytes(6 * GIB, Some(512 * MIB), 90), (6 * GIB) / 100 * 90);
-        // 8+ GiB discrete cards remain governed strictly by DXGI budget share.
         let rtx_8gb_budget = 7200 * MIB;
         assert_eq!(room_used_limit_bytes(rtx_8gb_budget, Some(8 * GIB), 90), rtx_8gb_budget / 100 * 90);
     }
@@ -1801,21 +1852,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    const LOW_VRAM: u64 = 6 << 30;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or_else(
-                || {
-                    let low_vram = crate::host::host()
-                        .and_then(|h| h.video_memory())
-                        .is_some_and(|[budget, ..]| budget <= LOW_VRAM);
-                    if low_vram { 0 } else { 3072 << 20 }
-                },
-                |mb| mb.min(8192) << 20,
-            )
+            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -1848,30 +1890,13 @@ pub(crate) fn room_lately() -> bool {
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
 #[cfg(windows)]
-fn default_room_percent(vram_budget: Option<u64>) -> u64 {
-    if vram_budget.is_some_and(|budget| budget <= 6 << 30) {
-        85
-    } else {
-        90
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn room_percent() -> u64 {
+fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or_else(
-                || {
-                    let budget = crate::host::host()
-                        .and_then(|h| h.video_memory())
-                        .map(|[budget, ..]| budget);
-                    default_room_percent(budget)
-                },
-                |percent| percent.clamp(50, 97),
-            )
+            .map_or(90, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -2143,7 +2168,7 @@ pub(crate) fn let_go_idle() {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep_for_limit(budget, used, room_percent())
+            crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2401,6 +2426,8 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            prefill: Default::default(),
+            prefilled: Default::default(),
             flags,
         }
     }
@@ -2426,6 +2453,8 @@ impl HostTexture {
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
+            prefill: Default::default(),
+            prefilled: Default::default(),
             flags,
         }
     }
@@ -2583,10 +2612,8 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel). Reserved textures (`VICTORY_LEVELS_ON_DEMAND=1`) must reach
-    // `CreateReservedResource` below instead of being allocated whole here.
-    if !reserved
-        && fills(desc)
+    // in no texel).
+    if fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2638,7 +2665,7 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
-        crate::residency::allocation_error(&e);
+        crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
@@ -2678,6 +2705,7 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
 
 // SAFETY: the host texture is named only in queue calls, which any thread
@@ -2831,6 +2859,7 @@ impl Drop for Resource {
         if self.desc.dimension != BUFFER {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
+            crate::texlate::gone(address);
             textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -3059,6 +3088,7 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -4648,10 +4678,6 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
-        assert_eq!(default_room_percent(None), 90);
-        assert_eq!(default_room_percent(Some(4 * GIB)), 85);
-        assert_eq!(default_room_percent(Some(6 * GIB)), 85);
-        assert_eq!(default_room_percent(Some(8 * GIB)), 90);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

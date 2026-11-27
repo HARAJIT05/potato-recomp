@@ -64,7 +64,6 @@
 //! Merged stages keep their stage data in another layout (not read).
 //!
 //! Kind 0x0c holds the same `FSSM` blob unpacked.
-//!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
 //! 0x12 16-byte blobs (0x10 is the shader hash).
@@ -999,6 +998,17 @@ mod tests {
     }
 
     #[test]
+    fn finds_programs_stored_without_xbch() {
+        let blob = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
+        let raw = native_programs(&part(&[(0x12, &[0; 16]), (KIND_NATIVE_RAW, &blob)])).unwrap();
+        let packed = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw, packed);
+        // A damaged raw blob is an error, not an empty container.
+        assert!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..blob.len() - 1])])).is_err());
+    }
+
+    #[test]
     fn reads_root_tables() {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
         let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
@@ -1046,17 +1056,6 @@ mod tests {
 
         blob[record + RECORD_COUNTS] = 9;
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
-    }
-
-    #[test]
-    fn finds_programs_stored_without_xbch() {
-        let blob = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
-        let raw = native_programs(&part(&[(0x12, &[0; 16]), (KIND_NATIVE_RAW, &blob)])).unwrap();
-        let packed = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
-        assert_eq!(raw.len(), 2);
-        assert_eq!(raw, packed);
-        // A damaged raw blob is an error, not an empty container.
-        assert!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..blob.len() - 1])])).is_err());
     }
 
     #[test]

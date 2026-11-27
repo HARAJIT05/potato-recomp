@@ -134,11 +134,6 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
-    /// A closed wrapper list owned by `thin` (`VICTORY_THIN=1`): its `host`
-    /// is detached cleanly at submission and lazily re-taken on the next
-    /// translation `Reset` instead of pre-allocating another `HostList`.
-    #[cfg(windows)]
-    thin_back: bool,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -154,7 +149,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -210,7 +205,8 @@ impl Detached {
     }
 
     /// Releases this list's dynamic descriptor slots once its GPU submission
-    /// has completed, without waiting for the full `bury_lag` allocator delay.
+    /// has completed, without waiting for the full `bury_lag` (64 submissions)
+    /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
     pub(crate) fn release_tables(&mut self) {
         self._state.tables_done();
     }
@@ -236,28 +232,14 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
-/// The most host lists kept idle (128 were too few on high-RAM hosts, while
-/// 512 command allocators consume several gigabytes of private commit on
-/// NVIDIA WDDM drivers when host RAM is `<= 32 GiB`).
+/// The most host lists kept idle (128 were too few: flights land several at
+/// a time, so lists were thrown away and others made in the same frame, with
+/// their preludes and buffers, 12 % of the submitting thread in the opening,
+/// profile cpu-1), and the most upload memory they may keep
+/// between them (a list keeps scratch chunks over a reset only while lists
+/// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-fn idle_most() -> (usize, u64) {
-    if crate::residency::limited_host_ram() {
-        (192, 128 << 20)
-    } else {
-        (512, 256 << 20)
-    }
-}
-
-/// Drops excess idle host command lists when system memory is pressured.
-#[cfg(windows)]
-pub(crate) fn trim_idle() {
-    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-    while idle.0.len() > 48 {
-        if let Some(Idle(_, bytes)) = idle.0.pop() {
-            idle.1 = idle.1.saturating_sub(bytes);
-        }
-    }
-}
+const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -294,12 +276,11 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    let (max_lists, max_bytes) = idle_most();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_lists {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -307,7 +288,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < max_lists && idle.1 + bytes <= max_bytes {
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -423,21 +404,16 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
+        let Some(fresh) = fresh_list() else {
+            continue;
+        };
+        // A new host list is open; the title's next call on its list is a
+        // reset, which wants it closed.
+        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let host = if list.thin_back {
-            list.host.take()
-        } else {
-            let Some(fresh) = fresh_list() else {
-                continue;
-            };
-            // A new host list is open; the title's next call on its list is a
-            // reset, which wants it closed.
-            fresh.close();
-            list.host.replace(fresh)
-        };
-        let Some(host) = host else {
+        let Some(host) = list.host.replace(fresh) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -500,22 +476,17 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
+        let Some(fresh) = fresh_list() else {
+            continue;
+        };
+        // A new host list is open; the title's next call on its list is a
+        // reset, which wants it closed.
+        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let host = if (*list).thin_back {
-                (*list).host.take()
-            } else {
-                let Some(fresh) = fresh_list() else {
-                    continue;
-                };
-                // A new host list is open; the title's next call on its list is a
-                // reset, which wants it closed.
-                fresh.close();
-                (*list).host.replace(fresh)
-            };
-            let Some(host) = host else {
+            let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
             let uploads =
@@ -614,46 +585,8 @@ fn new_list(
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
 fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
-    boxed_with(kind, pipeline, thin, false)
-}
-
-/// A backing wrapper list for `thin`: starts without a host list and acquires
-/// one lazily on reset.
-#[cfg(windows)]
-fn boxed_thin_back(kind: u32) -> Box<List> {
-    boxed_with(kind, std::ptr::null(), false, true)
-}
-
-/// Returns any unsubmitted `HostList` held by a dropped `thin` backing list
-/// directly into the bounded idle pool.
-#[cfg(windows)]
-fn reclaim_unused(this: This) {
-    if this.is_null() {
-        return;
-    }
-    // SAFETY: owned solely by the dropping `Recording`.
-    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-    list.uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    list.earlier.clear();
-    list.gate.clear();
-    if let Some(host) = list.host.take() {
-        host.close();
-        let (max_lists, max_bytes) = idle_most();
-        if pools() && IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() < max_lists {
-            host.reset();
-            let bytes = host.scratch_kept();
-            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-            if idle.0.len() < max_lists && idle.1 + bytes <= max_bytes {
-                idle.0.push(Idle(host, bytes));
-                idle.1 += bytes;
-            }
-        }
-    }
-}
-
-fn boxed_with(kind: u32, pipeline: This, thin: bool, thin_back: bool) -> Box<List> {
     #[cfg(not(windows))]
-    let _ = (thin, thin_back);
+    let _ = thin;
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
@@ -674,15 +607,13 @@ fn boxed_with(kind: u32, pipeline: This, thin: bool, thin_back: bool) -> Box<Lis
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host()
-            .filter(|_| !thin && !thin_back)
-            .and_then(|h| match h.new_list() {
-                Ok(list) => Some(list),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no host command list");
-                    None
-                }
-            }),
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
+            Ok(list) => Some(list),
+            Err(e) => {
+                tracing::warn!(error = %e, "no host command list");
+                None
+            }
+        }),
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -695,8 +626,6 @@ fn boxed_with(kind: u32, pipeline: This, thin: bool, thin_back: bool) -> Box<Lis
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
-        #[cfg(windows)]
-        thin_back,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -756,15 +685,6 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
-        if list.thin_back && list.host.is_none() {
-            list.host = fresh_list();
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .reset(pipeline);
-            crate::pipeline::bound(pipeline);
-            return S_OK;
-        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -892,7 +812,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.list.barriers(host) };
         }
     }
     0
@@ -905,8 +825,9 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
     }
 }
 
@@ -1664,7 +1585,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            unsafe { list.list.barriers(&[barrier]) };
         }
     }
     let _ = (this, flags, control, address, size);
@@ -1944,6 +1865,15 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Cumulative draw, dispatch, and indirect-execution counters since startup.
+static TOTALS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn totals() -> [u64; 3] {
+    TOTALS.each_ref().map(|t| t.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -1973,6 +1903,7 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    TOTALS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
@@ -2023,6 +1954,7 @@ pub(crate) fn take_indirect() -> u64 {
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOTALS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[cfg(not(windows))]
 extern "system" fn dispatch(_: This) {
@@ -2237,7 +2169,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.list.barriers(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

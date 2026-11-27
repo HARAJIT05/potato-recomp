@@ -2,7 +2,7 @@
 //! `port_descriptors`): the title's own code that copies descriptor records
 //! into its shader-visible heap as bytes tells the layer which slots it wrote.
 //!
-//! What the title does (target AAA game executable): each draw's and each
+//! What the title does (target console executable): each draw's and each
 //! dispatch's descriptor tables are allocated from its frame allocator
 //! (image +0x4d9f400; the allocator's memory is the placed shader-visible
 //! view heap) and filled by two functions, +0x4d9efd0 (graphics) and
@@ -38,8 +38,8 @@ pub struct Site {
     pub bytes: &'static [u8],
 }
 
-/// The six record stores of the table fillers (target AAA game executable,
-/// target build image offsets).
+/// The six record stores of the table fillers (target console executable,
+/// image offsets).
 pub const SITES: [Site; 6] = [
     // +0x4d9efd0, loop 1: [rcx+rsi]
     Site { window: 0x4d9f04f, store: 10, len: 5, bytes: &[0x81, 0xe1, 0xe0, 0x7f, 0x00, 0x00, 0xc5, 0xfc, 0x10, 0x00, 0xc5, 0xfc, 0x11, 0x04, 0x31, 0x0f, 0xb6, 0x47, 0x0b, 0x39, 0xc5] },
@@ -172,15 +172,197 @@ pub unsafe fn apply(base: usize, size: usize, marks: usize, sites: &[Site]) -> V
             *used += body.len().next_multiple_of(16);
             Hooked::Done
         })();
-        let offset = format_args!("{:#x}", site.window + site.store);
-        match done {
-            Hooked::Done => tracing::info!(site = %offset, "renderer port 2: the title's descriptor record store at title+site patched to tell the layer its slot (VICTORY_PORT_DESCRIPTORS)"),
-            Hooked::Differs => tracing::warn!(site = %offset, "renderer port 2: not patched, the title's bytes there are not the ones expected (another build?)"),
-            Hooked::Failed(why) => tracing::warn!(site = %offset, why, "renderer port 2: not patched"),
-        }
+        say(site.window + site.store, done, "the title's descriptor record store");
         out.push(done);
     }
     out
+}
+
+/// The title's own `memcpy` (target console executable, image offset).
+pub const TITLE_MEMCPY: usize = 0x5f4_0560;
+
+/// Additional descriptor table copy sites in the frame allocator (+0x4d9f200
+/// and +0x4d9f540) that complement the six single-record store sites.
+pub struct CallSite {
+    pub window: usize,
+    pub call: usize,
+    pub bytes: &'static [u8],
+}
+
+pub const COPY_CALLS: [CallSite; 2] = [
+    CallSite { window: 0x4d9_f37d, call: 9, bytes: &[0x48, 0x89, 0xd9, 0x4c, 0x89, 0xe2, 0x4d, 0x89, 0xf0, 0xe8, 0xd5, 0x11, 0x1a, 0x01] },
+    CallSite {
+        window: 0x4d9_f540,
+        call: 12,
+        bytes: &[0x48, 0x89, 0xc1, 0x4c, 0x89, 0xfa, 0x49, 0x89, 0xd8, 0x49, 0x89, 0xc6, 0xe8, 0x0f, 0x10, 0x1a, 0x01],
+    },
+];
+
+/// Four-slot (128-byte) AVX descriptor copy window in the frame allocator.
+pub const COPY_128: Site = Site {
+    window: 0x4d9_f25f,
+    store: 10,
+    len: 9,
+    bytes: &[
+        0xc5, 0xfc, 0x11, 0x5b, 0x60, 0xc5, 0xfc, 0x11, 0x53, 0x40, 0xc5, 0xfc, 0x11, 0x4b, 0x20, 0xc5, 0xfc, 0x11, 0x03, 0x4c, 0x89,
+        0xf9, 0x48, 0x89, 0xf2, 0x49, 0x89, 0xd8, 0x45, 0x31, 0xc9,
+    ],
+};
+
+fn copy_128_stub(at: usize, to: usize, marks: usize, len: usize) -> Option<Vec<u8>> {
+    let mut out = vec![0xc5, 0xfc, 0x11, 0x4b, 0x20]; // vmovups [rbx+20h], ymm1
+    out.extend([0xc5, 0xfc, 0x11, 0x03]); // vmovups [rbx], ymm0
+    out.extend([0x50, 0x52, 0x51]); // push rax ; push rdx ; push rcx
+    out.extend([0x48, 0x89, 0xd8]); // mov rax, rbx
+    out.extend([0x48, 0xba]); // mov rdx, marks
+    out.extend((marks as u64).to_le_bytes());
+    out.extend([0x48, 0x2b, 0x02]); // sub rax, [rdx]
+    out.extend([0x48, 0x3b, 0x42, 0x08]); // cmp rax, [rdx+8]
+    let skip_a = out.len();
+    out.extend([0x73, 0x00]); // jae past the marks
+    out.extend([0x48, 0x8d, 0x88, 0x80, 0x00, 0x00, 0x00]); // lea rcx, [rax+80h]
+    out.extend([0x48, 0x3b, 0x4a, 0x08]); // cmp rcx, [rdx+8]
+    let skip_b = out.len();
+    out.extend([0x77, 0x00]); // ja past the marks
+    out.extend([0x48, 0xc1, 0xe8, 0x05]); // shr rax, 5
+    out.extend([0x48, 0x8b, 0x4a, 0x10]); // mov rcx, [rdx+16]
+    out.extend([0xc7, 0x04, 0x01, 0x01, 0x01, 0x01, 0x01]); // mark four slots
+    out.extend([0x48, 0x8b, 0x4a, 0x18]); // mov rcx, [rdx+24]
+    out.extend([0x48, 0x89, 0xc2]); // mov rdx, rax
+    out.extend([0x48, 0xc1, 0xea, 0x07]); // shr rdx, 7
+    out.extend([0xc6, 0x04, 0x11, 0x01]); // first chunk
+    out.extend([0x48, 0x83, 0xc0, 0x03]); // add rax, 3
+    out.extend([0x48, 0xc1, 0xe8, 0x07]); // shr rax, 7
+    out.extend([0xc6, 0x04, 0x01, 0x01]); // last chunk
+    let past = out.len();
+    out[skip_a + 1] = u8::try_from(past - (skip_a + 2)).ok()?;
+    out[skip_b + 1] = u8::try_from(past - (skip_b + 2)).ok()?;
+    out.extend([0x59, 0x5a, 0x58]); // pop rcx ; pop rdx ; pop rax
+    let back = crate::console_insn::jump(to + out.len(), at + len)?;
+    out.extend(back);
+    Some(out)
+}
+
+unsafe fn write_code(at: usize, bytes: &[u8], len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut old = 0;
+    // SAFETY: caller guarantees `at..at + len` is title code patched before execution.
+    unsafe {
+        if VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        std::ptr::write_bytes(at as *mut u8, 0x90, len);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+        VirtualProtect(at as *const _, len, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
+    }
+    true
+}
+
+fn place_for(at: usize, body: &[u8], room: &mut Option<(usize, usize)>) -> Option<usize> {
+    if room.is_none() {
+        *room = crate::console_insn::near(at).map(|place| (place, 0));
+    }
+    let (place, used) = room.as_mut()?;
+    if *used + body.len() > crate::console_insn::STUBS_LEN {
+        return None;
+    }
+    let to = *place + *used;
+    // SAFETY: our own executable stub allocation written before running.
+    unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), to as *mut u8, body.len()) };
+    *used += body.len().next_multiple_of(16);
+    Some(to)
+}
+
+/// Hooks [`COPY_CALLS`] and [`COPY_128`] so table copies notify [`marks`].
+///
+/// # Safety
+/// As [`apply`]; `hook` must point to a valid function matching `memcpy`'s ABI.
+pub unsafe fn apply_copies(base: usize, size: usize, marks: usize, hook: usize) -> Vec<Hooked> {
+    let mut room: Option<(usize, usize)> = None;
+    let mut out = Vec::new();
+    for site in &COPY_CALLS {
+        let done = (|| {
+            if site.window.checked_add(site.bytes.len()).is_none_or(|end| end > size) {
+                return Hooked::Failed("outside the image");
+            }
+            let window = base + site.window;
+            // SAFETY: range verified within mapped image above.
+            let there = unsafe { std::slice::from_raw_parts(window as *const u8, site.bytes.len()) };
+            let at = window + site.call;
+            let rel = i32::from_le_bytes(site.bytes[site.call + 1..site.call + 5].try_into().unwrap_or_default());
+            if there != site.bytes || (at as i64 + 5 + i64::from(rel)) as usize != base + TITLE_MEMCPY {
+                return Hooked::Differs;
+            }
+            let mut body = vec![0x48, 0xb8]; // mov rax, hook
+            body.extend((hook as u64).to_le_bytes());
+            body.extend([0xff, 0xe0]); // jmp rax
+            let Some(to) = place_for(at, &body, &mut room) else {
+                return Hooked::Failed("no room for code near the title's");
+            };
+            let Some(mut call) = crate::console_insn::jump(at, to) else {
+                return Hooked::Failed("out of reach");
+            };
+            call[0] = 0xe8;
+            // SAFETY: patching an idle call site before title threads run.
+            if !unsafe { write_code(at, &call, 5) } {
+                return Hooked::Failed("Windows would not make it writable");
+            }
+            Hooked::Done
+        })();
+        say(site.window + site.call, done, "the title's memcpy of descriptor tables");
+        out.push(done);
+    }
+    let done = copy_128(base, size, marks, &COPY_128, &mut room);
+    say(COPY_128.window + COPY_128.store, done, "the title's 128-byte copy of a descriptor table");
+    out.push(done);
+    out
+}
+
+fn copy_128(base: usize, size: usize, marks: usize, site: &Site, room: &mut Option<(usize, usize)>) -> Hooked {
+    (|| {
+        if site.window.checked_add(site.bytes.len()).is_none_or(|end| end > size) {
+            return Hooked::Failed("outside the image");
+        }
+        let window = base + site.window;
+        // SAFETY: range verified within mapped image above.
+        let there = unsafe { std::slice::from_raw_parts(window as *const u8, site.bytes.len()) };
+        if there != site.bytes {
+            return Hooked::Differs;
+        }
+        let at = window + site.store;
+        if room.is_none() {
+            *room = crate::console_insn::near(at).map(|place| (place, 0));
+        }
+        let Some((place, used)) = *room else {
+            return Hooked::Failed("no room for code near the title's");
+        };
+        let Some(body) = copy_128_stub(at, place + used, marks, site.len) else {
+            return Hooked::Failed("out of reach");
+        };
+        let Some(to) = place_for(at, &body, room) else {
+            return Hooked::Failed("no room for code near the title's");
+        };
+        let Some(jump) = crate::console_insn::jump(at, to) else {
+            return Hooked::Failed("out of reach");
+        };
+        // SAFETY: patching an idle store site before title threads run.
+        if !unsafe { write_code(at, &jump, site.len) } {
+            return Hooked::Failed("Windows would not make it writable");
+        }
+        Hooked::Done
+    })()
+}
+
+fn say(offset: usize, done: Hooked, what: &str) {
+    let offset = format_args!("{offset:#x}");
+    match done {
+        Hooked::Done => tracing::info!(site = %offset, what, "renderer port 2: patched to tell the layer the slots it writes (VICTORY_PORT_DESCRIPTORS)"),
+        Hooked::Differs => tracing::warn!(site = %offset, what, "renderer port 2: not patched, the title's bytes there are not the ones expected (another build?)"),
+        Hooked::Failed(why) => tracing::warn!(site = %offset, what, why, "renderer port 2: not patched"),
+    }
 }
 
 #[cfg(test)]
@@ -274,7 +456,7 @@ mod tests {
                 let mine = [Site { window: 0x1100, ..*site }];
                 assert_eq!(apply(place, 0x10000, &raw const *marks as usize, &mine), [Hooked::Done]);
                 assert_eq!(*((place + 0x1100 + site.store) as *const u8), 0xe9);
-                let (plain, hooked): (F, F) = (std::mem::transmute(plain), std::mem::transmute(hooked));
+                let (plain, hooked): (F, F) = (std::mem::transmute::<usize, F>(plain), std::mem::transmute::<usize, F>(hooked));
                 let record: [u8; 32] = std::array::from_fn(|k| k as u8 ^ 0x5a);
                 // In the heap: slot 0x40 + 3 of its start.
                 let table = heap.add(0x2000 + 0x40 * 32);
@@ -296,6 +478,60 @@ mod tests {
                 assert!(slots.iter().chain(&chunks).all(|&b| b == 0));
                 drop(marks);
             }
+        }
+    }
+
+    #[test]
+    fn the_128_byte_copy_stores_and_marks_its_four_slots() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+        let mut code: Vec<u8> = vec![0x41, 0x57, 0x53];
+        code.extend([0x48, 0x89, 0xcb]);
+        code.extend([0x4d, 0x89, 0xc7]);
+        code.extend([0xc5, 0xfc, 0x10, 0x02]);
+        code.extend([0xc5, 0xfc, 0x10, 0x4a, 0x20]);
+        code.extend([0xc5, 0xfc, 0x10, 0x52, 0x40]);
+        code.extend([0xc5, 0xfc, 0x10, 0x5a, 0x60]);
+        let at = code.len();
+        code.extend(COPY_128.bytes);
+        code.extend([0x48, 0x89, 0xc8]);
+        code.extend([0x5b, 0x41, 0x5f]);
+        code.extend([0xc5, 0xf8, 0x77, 0xc3]);
+        type F = unsafe extern "system" fn(*mut u8, *const u8, u64) -> u64;
+        // SAFETY: self-contained RWX buffers owned by this unit test.
+        unsafe {
+            let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            assert_ne!(place, 0);
+            let (plain, hooked) = (place + 0x100 - at, place + 0x1100 - at);
+            std::ptr::copy_nonoverlapping(code.as_ptr(), plain as *mut u8, code.len());
+            std::ptr::copy_nonoverlapping(code.as_ptr(), hooked as *mut u8, code.len());
+            let heap = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+            let (mut slots, mut chunks) = (vec![0u8; 0x8000 / 32], vec![0u8; 0x8000 / 32 / 128]);
+            let marks = Box::new(Marks { start: heap as u64 + 0x2000, len: 0x8000, slots: slots.as_mut_ptr(), chunks: chunks.as_mut_ptr() });
+            let site = Site { window: 0x1100, ..COPY_128 };
+            let mut room = None;
+            assert_eq!(copy_128(place, 0x10000, &raw const *marks as usize, &site, &mut room), Hooked::Done);
+            assert_eq!(*((place + 0x1100 + COPY_128.store) as *const u8), 0xe9);
+            let after = COPY_128.store + COPY_128.len;
+            assert_eq!(&COPY_128.bytes[after..after + 3], &[0x4c, 0x89, 0xf9]);
+            assert_eq!(std::slice::from_raw_parts((place + 0x1100 + after) as *const u8, COPY_128.bytes.len() - after), &COPY_128.bytes[after..]);
+            let (plain, hooked): (F, F) = (std::mem::transmute::<usize, F>(plain), std::mem::transmute::<usize, F>(hooked));
+            let records: [u8; 128] = std::array::from_fn(|k| (k as u8).wrapping_mul(7) ^ 0x3c);
+            let table = heap.add(0x2000 + 126 * 32);
+            assert_eq!(plain(table.add(0x4000), records.as_ptr(), 0x5a5a), 0x5a5a);
+            assert_eq!(hooked(table, records.as_ptr(), 0x5a5a), 0x5a5a);
+            assert_eq!(std::slice::from_raw_parts(table, 128), &records);
+            assert_eq!(std::slice::from_raw_parts(table.add(0x4000), 128), &records);
+            assert_eq!(&slots[125..131], &[0, 1, 1, 1, 1, 0]);
+            assert_eq!(slots.iter().filter(|&&b| b != 0).count(), 4);
+            assert_eq!(&chunks[..2], &[1, 1]);
+            slots.fill(0);
+            chunks.fill(0);
+            for outside in [heap.add(0x1000), heap.add(0x2000 + 0x8000 - 64)] {
+                hooked(outside, records.as_ptr(), 1);
+                assert_eq!(std::slice::from_raw_parts(outside, 128), &records);
+            }
+            assert!(slots.iter().chain(&chunks).all(|&b| b == 0));
+            drop(marks);
         }
     }
 

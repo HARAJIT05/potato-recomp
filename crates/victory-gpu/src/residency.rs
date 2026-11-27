@@ -1,9 +1,38 @@
-﻿//! Host-memory admission for speculative texture work and reusable upload storage.
+//! Host-memory admission for speculative texture work and reusable upload storage.
+//!
+//! From codec-d/cool_fox (641835a4, fabb872a, c64fc9b4, 08e4574d, e94d277a; the
+//! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
+//! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
+//! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
+//! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
+//! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
+//! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
+//! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
+//! Off, nothing here changes anything, except that for 500 ms after the card
+//! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 const MIB: u64 = 1 << 20;
+
+/// `VICTORY_RESIDENCY`: host memory admission budgets (enabled by default on
+/// hosts with `<= 32 GiB` physical RAM; set `VICTORY_RESIDENCY=0` to disable
+/// or `VICTORY_RESIDENCY=1` to force on).
+fn residency_enabled(asked: Option<&std::ffi::OsStr>, total_phys: Option<u64>) -> bool {
+    match asked {
+        Some(v) => v != "0",
+        None => total_phys.is_some_and(|bytes| bytes <= 32 * GIB),
+    }
+}
+
+pub(crate) fn on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let phys = memory_status().map(|s| s.ullTotalPhys);
+        residency_enabled(std::env::var_os("VICTORY_RESIDENCY").as_deref(), phys)
+    })
+}
 const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
 static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -18,6 +47,7 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static AVAILABLE_PHYS: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
@@ -51,22 +81,26 @@ fn sample_commit(now: u64) -> u64 {
         && let Some(status) = memory_status()
     {
         AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        AVAILABLE_PHYS.store(status.ullAvailPhys, Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
 
 fn has_upload_reserve(commit: u64, bake: bool) -> bool {
     // Keep a protective floor against Rust/game OOM aborts without starving
-    // bindless world textures or one-shot ped decoration bakes when steady-state
-    // commit headroom sits in the 1-4 GiB range on 32 GiB hosts.
+    // bindless world textures or one-shot material bakes when steady-state
+    // commit headroom sits in the 1-4 GiB range on <=32 GiB hosts.
     commit >= if bake { 256 * MIB } else { 512 * MIB }
 }
 
 fn has_growth_reserve(commit: u64, bake: bool) -> bool {
-    // Growing a fresh 64 MiB upload block for speculative bindless prefetch
-    // requires more headroom than reusing slices already committed inside the
-    // staging pool.
+    // Growing a fresh upload block for speculative bindless prefetch requires
+    // more commit headroom than reusing slices already committed in the pool.
     commit >= if bake { 256 * MIB } else { 1024 * MIB }
+}
+
+fn has_physical_growth_reserve(physical: u64, bake: bool) -> bool {
+    physical >= if bake { 256 * MIB } else { 768 * MIB }
 }
 
 /// Leave commit for game allocations and submissions already in flight while
@@ -76,23 +110,36 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_upload_reserve(sample_commit(now), bake)
+    if !on() {
+        return true;
+    }
+    let commit = sample_commit(now);
+    let phys = AVAILABLE_PHYS.load(Ordering::Relaxed);
+    has_upload_reserve(commit, bake) && (bake || phys >= 384 * MIB)
 }
 
 /// Whether the staging allocator may commit a brand-new OS upload buffer
 /// (reusing existing free ranges in already-committed pool blocks stays open
 /// whenever `admit_texture_pass` is true).
 pub(crate) fn allow_staging_growth(bake: bool) -> bool {
+    if !on() {
+        return true;
+    }
     let now = crate::host::coarse_ms();
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    let commit = sample_commit(now);
+    let phys = AVAILABLE_PHYS.load(Ordering::Relaxed);
+    has_growth_reserve(commit, bake) && has_physical_growth_reserve(phys, bake)
 }
 
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
-    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    *LIMITED.get_or_init(|| {
+        on() && (std::env::var_os("VICTORY_RESIDENCY_LIMITED").is_some_and(|v| v == "1")
+            || memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    })
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
@@ -105,6 +152,9 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
 
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
+    if !on() {
+        return;
+    }
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
@@ -142,6 +192,9 @@ pub(crate) fn pressured() -> bool {
 /// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
 /// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
+    if !on() {
+        return false;
+    }
     let now = crate::host::coarse_ms();
     now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
 }
@@ -197,5 +250,17 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    #[test]
+    fn residency_defaults_on_for_limited_ram_and_respects_override() {
+        use std::ffi::OsStr;
+        assert!(residency_enabled(None, Some(16 * GIB)));
+        assert!(residency_enabled(None, Some(32 * GIB)));
+        assert!(!residency_enabled(None, Some(64 * GIB)));
+        assert!(!residency_enabled(Some(OsStr::new("0")), Some(16 * GIB)));
+        assert!(residency_enabled(Some(OsStr::new("1")), Some(64 * GIB)));
+        assert!(!has_physical_growth_reserve(512 * MIB, false));
+        assert!(has_physical_growth_reserve(512 * MIB, true));
     }
 }

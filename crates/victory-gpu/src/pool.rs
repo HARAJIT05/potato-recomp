@@ -27,8 +27,8 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one). Low-VRAM GPUs (`<= 6 GiB`)
-/// and host-RAM-limited PCs (`<= 32 GiB`) use 16 MiB blocks to curb fragmentation
-/// and allow faster heap reclamation when evicted.
+/// use 4 MiB blocks and host-RAM-limited PCs (`<= 32 GiB`) use 16 MiB staging
+/// blocks to curb fragmentation and allow faster reclamation when evicted.
 const BLOCK: u64 = 64 << 20;
 const LOW_MEM_BLOCK: u64 = 16 << 20;
 const LOW_VRAM_BLOCK: u64 = 4 << 20;
@@ -58,18 +58,16 @@ fn texture_block_bytes() -> u64 {
 fn staging_block_bytes() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
-        if crate::residency::limited_host_ram() {
-            LOW_MEM_BLOCK
-        } else {
-            BLOCK
-        }
+        if crate::residency::limited_host_ram() { LOW_MEM_BLOCK } else { BLOCK }
     })
 }
 
 fn texture_spare_limit(memory: Option<[u64; 4]>, keep: bool) -> usize {
     let limit = spares(memory, keep);
     if low_vram_budget(memory) {
-        if keep && memory.is_some_and(|[budget, used, ..]| u128::from(used) * 100 < u128::from(budget) * 85) {
+        if keep
+            && memory.is_some_and(|[budget, used, ..]| u128::from(used) * 100 < u128::from(budget) * 85)
+        {
             limit.min(4)
         } else {
             limit.min(1)
@@ -80,16 +78,17 @@ fn texture_spare_limit(memory: Option<[u64; 4]>, keep: bool) -> usize {
 }
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`]
-/// (tightly bounded on `<= 6 GiB` VRAM GPUs). Asked once a second.
+/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    if !crate::residency::on() {
+        SPARES.store(texture_spare_limit(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        return;
+    }
     let pressure = crate::residency::pressured();
-    let keep = crate::host::keep_freed() && !pressure;
-    let limit = texture_spare_limit(memory, keep);
+    let limit = texture_spare_limit(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
-    // A full pool can become idle while another subsystem needs the VRAM.
-    // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
@@ -98,12 +97,24 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             0
         } else if pressure {
             1
-        } else if crate::residency::limited_host_ram() {
-            limit.min(2)
         } else {
             limit
         };
         pool.reclaim(tick, staging_limit, true);
+    }
+}
+
+/// Immediately releases any idle empty texture and staging blocks after an
+/// `E_OUTOFMEMORY` failure so retries can reclaim memory without waiting for
+/// the next 1 Hz tick.
+pub(crate) fn reclaim_emergency() {
+    let tick = now();
+    SPARES.store(0, Ordering::Relaxed);
+    if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim(tick, 0, true);
+    }
+    if let Ok(mut pool) = STAGING.try_lock() {
+        pool.reclaim(tick, 0, true);
     }
 }
 
@@ -129,9 +140,8 @@ pub(crate) fn on() -> bool {
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
-/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12 by
-/// default on high-VRAM cards and 2 on `<= 6 GiB` cards; 0: none, and new
-/// blocks are used at once, as before).
+/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12;
+/// 0: none, and new blocks are used at once, as before).
 ///
 /// A page fault of lists already on the card, in a texture made the same
 /// tenth of a second as the first piece of a block made for it, lost the
@@ -143,15 +153,7 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| {
-        std::env::var("VICTORY_RIPE_BLOCKS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| {
-                let memory = crate::host::host().and_then(|h| h.video_memory());
-                if low_vram_budget(memory) { 2 } else { 12 }
-            })
-    })
+    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how
@@ -251,6 +253,8 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// No new block is asked for before this time after one was refused
+    /// ([`Pool::grow`]).
     retry_growth_at: u64,
     block_size: fn() -> u64,
 }
@@ -317,8 +321,6 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
-        // A failed block must not trigger another driver call for each
-        // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match found {
             Some(found) => found,
             None => {
@@ -347,6 +349,9 @@ impl<B: Clone> Pool<B> {
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
+    /// A new block from `make`, unless one was refused less than 500 ms ago
+    /// (codec-d/cool_fox 08e4574d: a refused 64 MiB block is not asked for
+    /// again for each small texture; the blocks there are still used).
     fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
         if now < self.retry_growth_at {
             return None;
@@ -381,6 +386,8 @@ impl<B: Clone> Pool<B> {
         self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
     }
 
+    /// [`Pool::rested`] with at most `limit` empty blocks kept; `sweep`: the
+    /// empty blocks are looked at even if no piece came back.
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let block_bytes = (self.block_size)();
         let mut any = false;
@@ -395,8 +402,8 @@ impl<B: Clone> Pool<B> {
         }
         // (Without a piece given back too, once there is less room.)
         let most = limit.min(self.most);
-        let previous = std::mem::replace(&mut self.spare, most);
-        if sweep || any || most < previous {
+        if sweep || any || most < self.spare {
+            self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(block_bytes)) {
@@ -411,10 +418,6 @@ impl<B: Clone> Pool<B> {
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
-    }
-
-    fn bytes(&self) -> u64 {
-        self.blocks() as u64 * (self.block_size)()
     }
 }
 
@@ -437,13 +440,15 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
-    lock(&TEXTURES).bytes().saturating_sub(HELD.load(Ordering::Relaxed))
+    (lock(&TEXTURES).blocks() as u64 * texture_block_bytes()).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).bytes() >> 20, lock(&STAGING).bytes() >> 20]
+    [
+        lock(&TEXTURES).blocks() as u64 * (texture_block_bytes() >> 20),
+        lock(&STAGING).blocks() as u64 * (staging_block_bytes() >> 20),
+    ]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -463,15 +468,15 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
+    let block_bytes = staging_block_bytes();
     let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        // Only gate speculative bindless prefetch on staging-pool growth
-        // headroom; table-bound textures and decoration bakes are sampled
-        // immediately and would otherwise read uninitialized/reused VRAM.
+        // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
+        // while commit is short; those a draw samples now still get one.)
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(staging_block_bytes())?;
+        let (buffer, data) = host.upload_buffer(block_bytes)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
@@ -541,18 +546,8 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     }
 }
 
-/// Textures made in the last second ([`fresh`]), and when.
-static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
-
 /// Textures currently placed inside [`TEXTURES`] pool blocks (`ID3D12Resource::as_raw`).
 static POOLED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-
-/// Whether `texture` was made in a block in the last second.
-pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
-    let raw = texture.as_raw() as usize;
-    let since = now().saturating_sub(1000);
-    RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
-}
 
 /// Whether `texture` is currently placed in a pool block ([`give_back_with`]).
 pub(crate) fn pooled(texture: &ID3D12Resource) -> bool {
@@ -564,13 +559,160 @@ pub(crate) fn pooled(texture: &ID3D12Resource) -> bool {
         .is_some_and(|set| set.contains(&raw))
 }
 
+/// Whether textures of 64 KiB and less are placed at multiples of 4 KiB in
+/// their block, where the host allows it (`VICTORY_POOL_SMALL=1`; otherwise
+/// at multiples of 64 KiB, as every other texture).
+///
+/// The two device losses of the night of 2026-11-25 with the pool in the
+/// report (runs steps-ab2 and start-3) faulted in the same kind of texture:
+/// 256x256, block-compressed, 7 levels, placed at a 4 KiB multiple that is no
+/// 64 KiB one (offsets 0x406000 and 0x3fe6000 of their blocks), never used
+/// before, read by the card the moment its slot was made; the descriptor's
+/// base of both lies 0xa000 into the piece, on a 64 KiB multiple, and its
+/// first level of 32 KiB from there ends 0x2000 past the piece. Why the card
+/// faulted there is not proven; textures at 64 KiB multiples have none of
+/// that, for some memory (at most 60 KiB a small texture).
+fn small_placement() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_POOL_SMALL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SMALL").is_some_and(|v| v != "0"))
+}
+
+/// Diagnostics: whether the card reads a pooled texture inside the piece it
+/// was placed in. A block's address is taken as the lowest of its textures'
+/// descriptor bases less their pieces' starts (a texture's first level may
+/// lie past its piece's start, never before it); a texture whose first level
+/// the card would read from past its piece's end is said loudly.
+#[cfg(feature = "diagnostics")]
+fn where_the_card_reads(heap: &ID3D12Heap, texture: &ID3D12Resource, piece: Piece) {
+    static BLOCKS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let Some(base) = crate::book::address(texture) else { return };
+    let Some(seen) = base.checked_sub(piece.start) else { return };
+    let raw = heap.as_raw() as usize;
+    let block = {
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        match blocks.iter_mut().find(|b| b.0 == raw) {
+            Some(b) => {
+                b.1 = b.1.min(seen);
+                b.1
+            }
+            None => {
+                if blocks.len() >= 4096 {
+                    blocks.remove(0);
+                }
+                blocks.push((raw, seen));
+                seen
+            }
+        }
+    };
+    let into = base - block - piece.start;
+    // SAFETY: a live texture.
+    let desc = unsafe { texture.GetDesc() };
+    // The first level's bytes, as a copy would have them.
+    let mut level = 0u64;
+    if let Some(host) = crate::host::made_host() {
+        // SAFETY: plain query of a valid description.
+        unsafe { host.device.GetCopyableFootprints(&desc, 0, 1, 0, None, None, None, Some(&raw mut level)) };
+    }
+    if into + level > piece.len {
+        let n = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 50 || n.is_power_of_two() {
+            // (Debug only: it assumes a texture's address is its block's
+            // start and its piece's offset, which this driver does not
+            // keep: 56 false alarms in run pool-1.)
+            tracing::debug!(
+                times = n,
+                base = format_args!("{base:#x}"),
+                piece_start = format_args!("{:#x}", piece.start),
+                piece_len = format_args!("{:#x}", piece.len),
+                into = format_args!("{into:#x}"),
+                first_level_bytes = format_args!("{level:#x}"),
+                width = desc.Width,
+                height = desc.Height,
+                levels = desc.MipLevels,
+                format = desc.Format.0,
+                "POOL: the card reads a pooled texture's first level past the end of the piece it was placed in"
+            );
+        }
+    }
+    // Every placement offset and where the first level lies, a few of them.
+    static SHOWN: AtomicU64 = AtomicU64::new(0);
+    if into > 0 && SHOWN.fetch_add(1, Ordering::Relaxed) < 40 {
+        tracing::info!(
+            into = format_args!("{into:#x}"),
+            piece_start = format_args!("{:#x}", piece.start),
+            piece_len = format_args!("{:#x}", piece.len),
+            width = desc.Width,
+            height = desc.Height,
+            levels = desc.MipLevels,
+            format = desc.Format.0,
+            alignment = desc.Alignment,
+            "pool: a texture's first level lies past its piece's start"
+        );
+    }
+}
+
+/// Textures made in the last second ([`fresh`]), and when.
+static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
+
+/// Whether `texture` was made in a block in the last second.
+pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
+    let raw = texture.as_raw() as usize;
+    let since = now().saturating_sub(1000);
+    RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
+}
+
 fn made_now(texture: &ID3D12Resource) {
     let now = now();
-    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
-    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
-        recent.pop_front();
+    let raw = texture.as_raw() as usize;
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        while recent.front().is_some_and(|r| r.1 + 1000 < now) {
+            recent.pop_front();
+        }
+        recent.push_back((raw, now));
     }
-    recent.push_back((texture.as_raw() as usize, now));
+    let begun = crate::host::submissions().0;
+    NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
+    let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let finished = crate::host::submissions().1;
+    // Those every submission begun before them has left behind are no
+    // one's concern any more (and a raw pointer may come again).
+    unseen.retain(|_, b| *b > finished);
+    unseen.insert(raw, begun);
+}
+
+/// Pooled textures made while submissions begun before them may still run:
+/// the submissions begun when each was made.
+static UNSEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>> = std::sync::LazyLock::new(Default::default);
+/// The newest of those numbers (nothing to look up once it has finished).
+static NEWEST_BEGUN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a texture was made in a block while a submission begun before
+/// it may still run ([`begun_before`]).
+pub(crate) fn any_unseen() -> bool {
+    NEWEST_BEGUN.load(Ordering::Relaxed) > crate::host::submissions().1
+}
+
+/// The submissions begun when `texture` was made in a block, if one of
+/// those may still be on the card: lists already sent then must not find it
+/// in a slot they read by index ([`crate::descriptor::host::show_new_later`]).
+/// Every device loss with the pool in the report (runs n08, n11, n15,
+/// steps-ab2, start-3 and the user's play-1125-2107) was a page fault at the
+/// first byte of a texture made that very millisecond, its title slot
+/// changed "at once" while lists sent before it read that slot by index.
+pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
+    if !any_unseen() {
+        return None;
+    }
+    let finished = crate::host::submissions().1;
+    let raw = texture.as_raw() as usize;
+    let unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
@@ -582,7 +724,12 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(std::collections::HashSet::new)
         .insert(raw);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), raw, piece }));
+    let made = Box::into_raw(Box::new(Reclaim {
+        methods: &RECLAIM.0,
+        references: AtomicU32::new(1),
+        raw,
+        piece,
+    }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -612,10 +759,11 @@ pub(crate) unsafe fn texture(
         return None;
     }
     // Small textures lie at multiples of 4 KiB where the host allows it
-    // (the top mip is 64 KiB at most): 64 KiB each otherwise.
+    // (the top mip is 64 KiB at most) and [`small_placement`] says so: 64 KiB
+    // each otherwise.
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
-    d.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+    d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
@@ -672,6 +820,7 @@ pub(crate) unsafe fn texture(
             #[cfg(feature = "diagnostics")]
             {
                 crate::book::made(&made, || "a texture in a block".into());
+                where_the_card_reads(&heap, &made, piece);
                 crate::book::block(&heap, &made, piece.start, block_bytes);
                 crate::book::note(made.as_raw() as usize, || {
                     let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
@@ -701,34 +850,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ranges_are_cut_aligned_and_join_again() {
-        let mut r = Ranges::new(1024);
-        assert_eq!(r.take(100, 64), Some(0));
-        assert_eq!(r.take(100, 64), Some(128));
-        assert_eq!(r.take(28, 4), Some(100));
-        assert_eq!(r.take(2000, 4), None);
-        r.give(128, 100);
-        r.give(0, 100);
-        assert!(!r.whole(1024));
-        r.give(100, 28);
-        assert!(r.whole(1024));
-    }
-
-    #[test]
-    fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
-        assert_eq!(spares(None, true), SPARE);
-        assert_eq!(texture_spare_limit(Some([4 << 30, 2 << 30, 0, 0]), true), 4);
-        assert_eq!(texture_spare_limit(Some([4 << 30, 35 << 29, 0, 0]), true), 1);
-    }
-
-    #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);
-        let refuse = || { calls.set(calls.get() + 1); None };
+        let refuse = || {
+            calls.set(calls.get() + 1);
+            None
+        };
         for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
             assert!(pool.take(size, 512, 12, refuse).is_none());
         }
@@ -756,6 +884,28 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn ranges_are_cut_aligned_and_join_again() {
+        let mut r = Ranges::new(1024);
+        assert_eq!(r.take(100, 64), Some(0));
+        assert_eq!(r.take(100, 64), Some(128));
+        assert_eq!(r.take(28, 4), Some(100));
+        assert_eq!(r.take(2000, 4), None);
+        r.give(128, 100);
+        r.give(0, 100);
+        assert!(!r.whole(1024));
+        r.give(100, 28);
+        assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn empty_blocks_stay_while_the_card_has_room() {
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        assert_eq!(spares(None, true), SPARE);
     }
 
     #[test]
@@ -825,6 +975,46 @@ mod tests {
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
         assert_eq!(made.get(), n);
         assert!(pool.take(BLOCK, 65536, 0, make).is_none());
+    }
+
+    /// A texture placed in a heap holds no reference to it that its count
+    /// shows (this host, 2026-11-25: 1 before placing, 1 with the texture):
+    /// the pool must not count on one, and does not (a block goes only with
+    /// every piece back and rested, [`Pool::rested`]). Said here, and the
+    /// count is the same again once the texture went.
+    #[test]
+    fn a_placed_texture_holds_its_heap() {
+        let Some(host) = crate::host::host() else { return };
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: 1 << 20,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        unsafe { host.device.CreateHeap(&desc, &mut heap) }.unwrap();
+        let heap = heap.unwrap();
+        let before = crate::host::references(&heap);
+        let texture_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: a live heap, a valid description.
+        unsafe { host.device.CreatePlacedResource(&heap, 0, &texture_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made) }.unwrap();
+        let made = made.unwrap();
+        let held = crate::host::references(&heap);
+        println!("heap references: {before} before placing, {held} with a texture in it");
+        assert!(held >= before);
+        drop(made);
+        assert_eq!(crate::host::references(&heap), before);
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not

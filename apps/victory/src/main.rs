@@ -13,6 +13,7 @@ mod translate;
 #[cfg(windows)]
 mod warm;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -30,6 +31,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
@@ -64,8 +66,8 @@ enum Command {
     /// archives, if uncompressed) and report their layout.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
-        #[arg(long)]
+        /// Print one line per container found and show why paths were skipped.
+        #[arg(short, long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
@@ -73,6 +75,11 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    ///
+    /// VICTORY_HOST_WAVE overrides the host wave width, including with --warm.
+    /// VICTORY_HOST_MAX_WAVE is a compatibility alias. When both values are
+    /// valid, VICTORY_HOST_WAVE takes precedence. Zero means unknown width.
+    /// For ordinary translation, VICTORY_HOST_RDNA=1 selects RDNA float settings.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -86,7 +93,7 @@ enum Command {
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
@@ -97,12 +104,14 @@ enum Command {
         warm: Option<PathBuf>,
     },
     /// Translate every shader found (as `translate` finds them) into the
-    /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// shader cache, so that no run has to: a few minutes, once per version
+    /// of the translator. Translations an earlier build of the same version
+    /// cached are made again, and those that came out different counted.
+    /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// Also write every shader that does not translate to this file,
         /// one line each: hash, where it was found, why.
@@ -113,15 +122,20 @@ enum Command {
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
     /// driver's cache on disk has them before a run needs one: once per change
     /// of the translator or the driver. Goes on where it was stopped.
+    ///
+    /// Pipelines that crash or hang the compiler are listed in `warm-bad.txt`
+    /// with the current fingerprint and retried automatically after a driver
+    /// or translator change. Set `VICTORY_WARM_BAD=0` to ignore `warm-bad.txt`
+    /// for this invocation.
     #[cfg(windows)]
     Warm {
         /// Processes at once (default: two thirds of the logical cores).
-        #[arg(long)]
+        #[arg(long, value_parser = parse_jobs)]
         jobs: Option<usize>,
         /// At most this many pipelines.
         #[arg(long)]
         limit: Option<usize>,
-        /// Those made before too.
+        /// Retry pipelines already made or listed in `warm-bad.txt` too.
         #[arg(long)]
         again: bool,
         /// Only the pipelines earlier runs drew with.
@@ -171,6 +185,13 @@ enum Console {
     SeriesS,
 }
 
+fn parse_jobs(value: &str) -> Result<usize, &'static str> {
+    value
+        .parse::<NonZeroUsize>()
+        .map(NonZeroUsize::get)
+        .map_err(|_| "expected a worker count of 1 or more")
+}
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -208,14 +229,15 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
-                victory_shader::emit::set_host_max_wave(n);
-            }
+            let wave = translate::host_wave::select(
+                std::env::var_os("VICTORY_HOST_WAVE").as_deref(),
+                std::env::var_os("VICTORY_HOST_MAX_WAVE").as_deref(),
+                |message| eprintln!("{message}"),
+            );
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs, wave);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, wave)
         }
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
@@ -256,16 +278,25 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
-    for p in cfg
-        .game_dir
-        .iter()
-        .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir, &cfg.data_dir])
-    {
+    check_policy(
+        cfg.game_dir
+            .iter()
+            .chain(&cfg.test_titles)
+            .chain([&cfg.cache_dir, &cfg.data_dir]),
+    )
+}
+
+/// Each path that breaks the repository rule, on stderr; an error (so a
+/// non-zero exit) when there is one, as the commands that use them stop.
+fn check_policy<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    let mut violations = 0;
+    for p in paths {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
-            println!("POLICY VIOLATION: {e}");
+            eprintln!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    anyhow::ensure!(violations == 0, "{violations} policy violation(s)");
     Ok(())
 }
 
@@ -281,4 +312,19 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_check_fails_on_a_path_inside_the_repo() {
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().to_path_buf();
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cache");
+        assert!(check_policy([&outside]).is_ok());
+        let err = check_policy([&outside, &inside, &inside]).unwrap_err();
+        assert_eq!(err.to_string(), "2 policy violation(s)");
+    }
 }

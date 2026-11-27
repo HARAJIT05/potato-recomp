@@ -53,17 +53,19 @@ if not defined VICTORY_RUNNER (
 
 if not defined VICTORY_DEFAULT_ADAPTER set "VICTORY_DEFAULT_ADAPTER="
 
-REM --- No Ray Tracing (indoor ambient preserved via ambient.rs floor + clear_air cap) ---
+REM --- No Ray Tracing (indoor ambient preserved via ambient.rs floor + clear_air cap + clock settle) ---
 set "VICTORY_BVH_BUILDER="
 set "VICTORY_RT_RESOLVE=0"
 set "VICTORY_ACTIVATE_RAYS=0"
-set "VICTORY_RT_TRACE=1"
 set "VICTORY_AMBIENT=0.8"
 set "VICTORY_AMBIENT_MIN=0.025"
 set "VICTORY_AMBIENT_AIR=1.5"
+set "VICTORY_AMBIENT_SETTLE=250,3"
+set "VICTORY_SHADER_FAST_BITS=24"
 set "VICTORY_WAVE_WIDE="
 
-REM --- 4 GB VRAM & Texture Streaming Fixes ---
+REM --- 4 GB VRAM, Host Residency & Texture Streaming Fixes ---
+set "VICTORY_RESIDENCY=1"
 set "VICTORY_TEXTURE_POOL=0"
 set "VICTORY_LEVELS_ON_DEMAND=1"
 set "VICTORY_LEVELS_MIN_KB=512"
@@ -71,10 +73,22 @@ set "VICTORY_CARD_ROOM_FOR_TARGETS_MB=1280"
 set "VICTORY_CARD_ROOM_FOR_BUFFERS=0"
 set "VICTORY_CARD_BUFFERS_MB=96"
 set "VICTORY_CARD_BUFFERS_MIN_MB=2"
-set "VICTORY_TEXTURE_ROOM_PERCENT=95"
+set "VICTORY_TEXTURE_ROOM_PERCENT=90"
+set "VICTORY_DYNAMIC_SLOTS=327680"
 
-REM --- Frame Pacing, Descriptor Port 2 & Async Submission ---
+REM --- 720p Output (title upscaler avoids Series S FSR4 1080p table mismatch), Renderer Ports 1/2/5/6/7, Fast Copy & Async Submission ---
+set "VICTORY_OUTPUT=1280x720"
+set "VICTORY_UPSCALER=6"
+set "VICTORY_FRAME_INTERVAL_MS=16.667"
+set "VICTORY_FPS_LOG=1"
+set "VICTORY_PORT_CONSTANTS=1"
+set "VICTORY_PORT_CONSTANTS_ORDER=1"
 set "VICTORY_PORT_DESCRIPTORS=1"
+set "VICTORY_PORT_COPIES=1"
+set "VICTORY_PORT_CBV=1"
+set "VICTORY_PORT_GUARD=1"
+set "VICTORY_PORT_JOURNAL=1"
+set "VICTORY_COPY_PLAIN=1"
 set "VICTORY_THIN=1"
 set "VICTORY_ASYNC_SUBMIT=1"
 set "VICTORY_JOIN_PARTS=8"
@@ -90,8 +104,10 @@ set "VICTORY_INDIRECT_WINDOW=1"
 set "VICTORY_INDIRECT_BATCH=2"
 set "VICTORY_SHOW_AFTER=1"
 set "VICTORY_MAP_THREADS=1"
+set "VICTORY_TITLE_PRIORITIES=0"
 set "VICTORY_CARD_AWAKE=1"
 set "VICTORY_INDIRECT_REST=0"
+if not defined VICTORY_KBM_PC set "VICTORY_KBM_PC=1"
 
 echo Starting AAA game ^(potato-recomp 4 GB No-RT profile^)...
 echo Game:  %VICTORY_GAME_DIR%\%VICTORY_GAME_EXE%

@@ -3,7 +3,7 @@
 //! every changed heap page goes (`VICTORY_PORT_DESCRIPTORS=1`, off by
 //! default; read in [`on`]).
 //!
-//! What the title does (target AAA game executable; `victory-loader`'s
+//! What the title does (target console executable; `victory-loader`'s
 //! `descriptor_sites` has the code): its placed shader-visible view heap is
 //! the memory of its frame allocator (image +0x4d9f400), which hands out the
 //! draws' and dispatches' descriptor tables and much else (constants, list
@@ -224,22 +224,8 @@ pub(crate) fn faulted(at: usize, rip: usize) {
     }
 }
 
-/// Frames between askings of the write watch for the fallback
-/// (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`, 8 if not given).
-fn check_every() -> u64 {
-    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1))
-}
+static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback { pages: std::collections::BTreeSet::new(), asked: 0, looked: 0, next: 0 });
 
-/// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`,
-/// 16 if not given; 0: none).
-fn check_budget() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16usize))
-}
-
-/// The fallback's pages: those the watch said were written, not looked at yet;
-/// the frame it last asked in, and the frame it last looked in.
 struct Fallback {
     pages: std::collections::BTreeSet<usize>,
     asked: u64,
@@ -248,10 +234,42 @@ struct Fallback {
     next: usize,
 }
 
-static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback { pages: std::collections::BTreeSet::new(), asked: 0, looked: 0, next: 0 });
+/// Frames between askings of the write watch for the fallback
+/// (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`, 8 if not given).
+fn check_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| every_of(std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY").ok().as_deref()))
+}
+
+/// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`,
+/// 16 if not given; `all`: every written page at every sync; 0: none).
+fn check_budget() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| budget_of(std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().as_deref()))
+}
+
+fn budget_of(spec: Option<&str>) -> usize {
+    match spec.map(str::trim) {
+        None => 16,
+        Some("all") => usize::MAX,
+        Some(v) => v.parse().unwrap_or(16),
+    }
+}
+
+fn every_of(spec: Option<&str>) -> u64 {
+    spec.and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1)
+}
+
+/// Whether the fallback checks every written page on every sync.
+fn whole() -> bool {
+    check_budget() == usize::MAX && check_every() == 1
+}
 
 /// Whether to ask the write watch of the marked heap this frame.
 pub(crate) fn ask_due(frame: u64) -> bool {
+    if whole() {
+        return true;
+    }
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
     if check_budget() == 0 || f.asked != 0 && frame < f.asked + check_every() {
         return false;
@@ -275,6 +293,11 @@ pub(crate) fn asked(ranges: &[(usize, usize)]) {
 /// The pages to look at whole this frame (once a frame; none after).
 pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    if whole() {
+        let out: Vec<usize> = std::mem::take(&mut f.pages).into_iter().collect();
+        CHECKED[0].fetch_add(out.len() as u64, Relaxed);
+        return out;
+    }
     if f.looked == frame {
         return Vec::new();
     }
@@ -293,16 +316,124 @@ pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     out
 }
 
+/// Builds disjoint `(from, to, check)` ranges for `descriptor::sync_heaps`
+/// from the sorted, disjoint mark runs `(first, count)` and the fallback
+/// `pages`, trimming or dropping any marked run that overlaps a fallback page.
+/// Also returns the sorted, disjoint slot runs `(first, count)` that were
+/// taken by [`take`] and fall inside a fallback page so [`missed`] does not
+/// count them as unreported.
+pub(crate) fn plan_parts(
+    start: u64,
+    end: u64,
+    step: u64,
+    mirrored_count: u32,
+    runs: &[(u32, u32)],
+    pages: &[usize],
+    page_size: usize,
+) -> (Vec<(usize, usize, bool)>, Vec<(u32, u32)>) {
+    let start_usize = start as usize;
+    let end_usize = end as usize;
+    let step_usize = step as usize;
+    let mirrored = u64::from(mirrored_count);
+
+    let mut check_parts: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+    let mut check_slots: Vec<(u64, u64)> = Vec::with_capacity(pages.len());
+    for &page in pages {
+        let p_from = page.max(start_usize);
+        let p_to = page.saturating_add(page_size).min(end_usize);
+        if p_from >= p_to {
+            continue;
+        }
+        check_parts.push((p_from, p_to));
+        let c_first = ((p_from - start_usize) as u64).div_ceil(step);
+        let c_end = ((p_to - start_usize) as u64 / step).min(mirrored);
+        if c_first < c_end {
+            check_slots.push((c_first, c_end));
+        }
+    }
+    check_slots.sort_unstable_by_key(|&(first, _)| first);
+    let mut merged_checks: Vec<(u64, u64)> = Vec::with_capacity(check_slots.len());
+    for (c_first, c_end) in check_slots {
+        match merged_checks.last_mut() {
+            Some((_, prev_end)) if c_first <= *prev_end => {
+                *prev_end = (*prev_end).max(c_end);
+            }
+            _ => merged_checks.push((c_first, c_end)),
+        }
+    }
+
+    let mut parts: Vec<(usize, usize, bool)> = Vec::with_capacity(runs.len() + check_parts.len());
+    let mut taken_in_check: Vec<(u32, u32)> = Vec::new();
+    let mut ci = 0usize;
+    for &(first, n) in runs {
+        if n == 0 {
+            continue;
+        }
+        let mut cur = u64::from(first);
+        let r_end = cur + u64::from(n);
+        while ci < merged_checks.len() && merged_checks[ci].1 <= cur {
+            ci += 1;
+        }
+        while ci < merged_checks.len() && merged_checks[ci].0 < r_end {
+            let (c_first, c_end) = merged_checks[ci];
+            if cur < c_first {
+                let len = c_first - cur;
+                let from = start_usize + cur as usize * step_usize;
+                parts.push((from, from + len as usize * step_usize, false));
+            }
+            let ov_start = cur.max(c_first);
+            let ov_end = r_end.min(c_end);
+            if ov_start < ov_end {
+                let ov_first = ov_start as u32;
+                let ov_len = (ov_end - ov_start) as u32;
+                match taken_in_check.last_mut() {
+                    Some((prev_first, prev_len)) if u64::from(*prev_first) + u64::from(*prev_len) == ov_start => {
+                        *prev_len += ov_len;
+                    }
+                    _ => taken_in_check.push((ov_first, ov_len)),
+                }
+            }
+            cur = ov_end;
+            if c_end <= r_end {
+                ci += 1;
+            } else {
+                break;
+            }
+        }
+        if cur < r_end {
+            let len = r_end - cur;
+            let from = start_usize + cur as usize * step_usize;
+            parts.push((from, from + len as usize * step_usize, false));
+        }
+    }
+    for (p_from, p_to) in check_parts {
+        parts.push((p_from, p_to, true));
+    }
+    (parts, taken_in_check)
+}
+
+/// Whether `index` lies in `taken_in_check` (sorted, disjoint `(first, count)` runs).
+pub(crate) fn was_taken_in_check(taken_in_check: &[(u32, u32)], index: u32) -> bool {
+    let i = taken_in_check.partition_point(|&(first, _)| first <= index);
+    i > 0 && {
+        let (first, count) = taken_in_check[i - 1];
+        u64::from(index) < u64::from(first) + u64::from(count)
+    }
+}
+
+/// Whether the fallback warning for the `n`-th (0-based) missed view record
+/// since the start should be logged.
+#[inline]
+fn should_warn_missed(n: u64) -> bool {
+    n < 20 || n.is_power_of_two()
+}
+
 /// The fallback found slot `index` (at `handle`) with a new record: a view
 /// record that no mark told of is counted and said.
 pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     if !view {
         CHECKED[2].fetch_add(1, Relaxed);
         return;
-    }
-    if tabled {
-        // A draw read it through a table lately: the draw makes it anyway.
-        CHECKED[5].fetch_add(1, Relaxed);
     }
     let adopted = ADOPTED.read().unwrap_or_else(|e| e.into_inner());
     let Some(a) = adopted.as_ref() else { return };
@@ -311,8 +442,12 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         CHECKED[3].fetch_add(1, Relaxed);
         return;
     }
-    let n = CHECKED[1].fetch_add(1, Relaxed);
-    MISSED_ALL.fetch_add(1, Relaxed);
+    CHECKED[1].fetch_add(1, Relaxed);
+    if tabled {
+        // A draw read it through a table lately: the draw makes it anyway.
+        CHECKED[5].fetch_add(1, Relaxed);
+    }
+    let n = MISSED_ALL.fetch_add(1, Relaxed);
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
     let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
@@ -320,7 +455,7 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         *by.entry(writer.clone()).or_default() += 1;
     }
-    if n < 20 || n.is_power_of_two() {
+    if should_warn_missed(n) {
         tracing::warn!(
             slot = index,
             handle = format_args!("{handle:#x}"),
@@ -398,6 +533,46 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     out
 }
 
+/// Title's own `memcpy` hooked by `apply_copies` (`VICTORY_PORT_COPIES=1`).
+static TITLE_MEMCPY: AtomicUsize = AtomicUsize::new(0);
+static TITLE_COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub fn title_copy_hook(real: usize) -> usize {
+    TITLE_MEMCPY.store(real, Relaxed);
+    title_copy as *const () as usize
+}
+
+unsafe extern "system-unwind" fn title_copy(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: title's own `memcpy`, recorded before execution starts.
+    let real: Copy = unsafe { std::mem::transmute(TITLE_MEMCPY.load(Relaxed)) };
+    // SAFETY: delegates directly to title's `memcpy`.
+    let out = unsafe { real(to, from, n) };
+    let marked = mark_range(to as u64, n as u64);
+    if marked > 0 {
+        TITLE_COPIES[0].fetch_add(1, Relaxed);
+        TITLE_COPIES[1].fetch_add(marked, Relaxed);
+    }
+    out
+}
+
+/// Marks every slot in the adopted heap intersecting `[to, to + n)`.
+fn mark_range(to: u64, n: u64) -> u64 {
+    let len = MARKS.len.load(Acquire);
+    if len == 0 || n == 0 {
+        return 0;
+    }
+    let start = MARKS.start.load(Relaxed);
+    let (lo, hi) = (to.max(start), to.saturating_add(n).min(start + len));
+    if lo >= hi {
+        return 0;
+    }
+    let (first, last) = ((lo - start) / 32, (hi - 1 - start) / 32);
+    for slot in first..=last {
+        mark_slot(slot as usize);
+    }
+    last - first + 1
+}
+
 /// Marks slot `slot` of the marked heap (in it: checked by the caller).
 #[inline]
 fn mark_slot(slot: usize) {
@@ -433,6 +608,7 @@ pub(crate) fn line(frames: f64) {
     let ours = MARKED_BY_US.swap(0, Relaxed);
     let [pages, missed, other, pending, check_ns, tabled] = [0, 1, 2, 3, 4, 5].map(|i| CHECKED[i].swap(0, Relaxed));
     let copies = [0, 1].map(|i| COPIES[i].swap(0, Relaxed));
+    let title_copies = [0, 1].map(|i| TITLE_COPIES[i].swap(0, Relaxed));
     ALL[0].fetch_add(taken, Relaxed);
     ALL[1].fetch_add(ours, Relaxed);
     ALL[2].fetch_add(pages, Relaxed);
@@ -448,7 +624,7 @@ pub(crate) fn line(frames: f64) {
     };
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
-         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
+         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; its own memcpy's table copies {:.0}, {:.0} slots they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
          since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
@@ -457,6 +633,8 @@ pub(crate) fn line(frames: f64) {
         ns as f64 / 1e6 / frames,
         copies[0] as f64 / frames,
         copies[1] as f64 / frames,
+        title_copies[0] as f64 / frames,
+        title_copies[1] as f64 / frames,
         pages as f64 / frames,
         missed as f64 / frames,
         tabled as f64 / frames,
@@ -475,6 +653,8 @@ pub(crate) fn line(frames: f64) {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn marks_layout_is_what_the_stores_read() {
         assert_eq!(size_of::<Marks>(), victory_loader_marks_len());
@@ -489,10 +669,38 @@ mod tests {
         32
     }
 
+    #[test]
+    fn a_copy_marks_the_slots_it_wrote() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start = 0x2000_0000u64;
+        assert!(adopt_now(start, 1000));
+        assert_eq!(mark_range(start + 32 * 10 + 16, 64), 3);
+        assert_eq!(mark_range(start - 64, 64), 0);
+        assert_eq!(mark_range(start - 16, 32), 1);
+        assert_eq!(mark_range(start + 32 * 999, 4096), 1);
+        assert_eq!(mark_range(start + 32 * 20, 0), 0);
+        assert_eq!(take(start).unwrap(), [(0, 1), (10, 3), (999, 1)]);
+        let_go(start);
+        assert_eq!(mark_range(start, 32), 0);
+    }
+
+    #[test]
+    fn fallback_keeps_the_ports_budget_unless_told_otherwise() {
+        assert_eq!(budget_of(None), 16);
+        assert_eq!(budget_of(Some("all")), usize::MAX);
+        assert_eq!(budget_of(Some(" 32 ")), 32);
+        assert_eq!(budget_of(Some("0")), 0);
+        assert_eq!(budget_of(Some("x")), 16);
+        assert_eq!(every_of(None), 8);
+        assert_eq!(every_of(Some("1")), 1);
+        assert_eq!(every_of(Some("0")), 1);
+    }
+
     /// Slots marked as the stores mark them, and by our calls, come out once
     /// each, as runs; outside the heap nothing is marked.
     #[test]
     fn marked_slots_are_taken_once_as_runs() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let start = 0x1000_0000u64;
         assert!(adopt_now(start, 1000));
         assert!(adopted(start) && !adopted(start + 32));
@@ -515,5 +723,106 @@ mod tests {
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn plan_parts_keeps_marked_runs_and_check_pages_disjoint() {
+        let start = 0x2000_0000u64;
+        let step = 32u64;
+        let page_size = 65536usize; // 2048 slots per page
+        let count = 8192u32;
+        let end = start + u64::from(count) * step;
+        let start_usize = start as usize;
+
+        // Pass fallback pages in wrap-around order (page 2, then page 1).
+        let pages = [start_usize + 2 * page_size, start_usize + page_size];
+        let runs = [
+            (100, 10),   // wholly before page 1
+            (2040, 15),  // straddles start of page 1 (2040..2048 kept, 2048..2055 in page 1)
+            (2060, 10),  // wholly inside page 1
+            (4090, 12),  // straddles page 1 / page 2 boundary (4090..4102 wholly inside merged checks)
+            (6140, 10),  // straddles end of page 2 (6140..6144 in page 2, 6144..6150 kept)
+        ];
+
+        let (parts, taken_in_check) = plan_parts(start, end, step, count, &runs, &pages, page_size);
+
+        let false_parts: Vec<(usize, usize)> = parts.iter().filter(|&&(_, _, check)| !check).map(|&(f, t, _)| (f, t)).collect();
+        let true_parts: Vec<(usize, usize)> = parts.iter().filter(|&&(_, _, check)| check).map(|&(f, t, _)| (f, t)).collect();
+
+        assert_eq!(
+            false_parts,
+            vec![
+                (start_usize + 100 * 32, start_usize + 110 * 32),
+                (start_usize + 2040 * 32, start_usize + 2048 * 32),
+                (start_usize + 6144 * 32, start_usize + 6150 * 32),
+            ]
+        );
+        assert_eq!(
+            true_parts,
+            vec![
+                (start_usize + 2 * page_size, start_usize + 3 * page_size),
+                (start_usize + page_size, start_usize + 2 * page_size),
+            ]
+        );
+
+        // Verify all parts are pairwise disjoint.
+        let mut all_ranges: Vec<(usize, usize)> = parts.iter().map(|&(f, t, _)| (f, t)).collect();
+        all_ranges.sort_unstable();
+        for w in all_ranges.windows(2) {
+            assert!(w[0].1 <= w[1].0, "overlapping parts: {:?} and {:?}", w[0], w[1]);
+        }
+
+        // Verify taken_in_check covers exact overlapping slots.
+        assert_eq!(taken_in_check, vec![(2048, 7), (2060, 10), (4090, 12), (6140, 4)]);
+        assert!(!was_taken_in_check(&taken_in_check, 2047));
+        assert!(was_taken_in_check(&taken_in_check, 2048));
+        assert!(was_taken_in_check(&taken_in_check, 2054));
+        assert!(!was_taken_in_check(&taken_in_check, 2055));
+        assert!(was_taken_in_check(&taken_in_check, 4096));
+        assert!(was_taken_in_check(&taken_in_check, 6143));
+        assert!(!was_taken_in_check(&taken_in_check, 6144));
+    }
+
+    #[test]
+    fn missed_counts_tabled_after_marked_and_keeps_global_warn_counter() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let start = 0x3000_0000u64;
+        assert!(adopt_now(start, 256));
+        for c in &CHECKED {
+            c.store(0, Relaxed);
+        }
+        MISSED_ALL.store(0, Relaxed);
+        WRITERS.lock().unwrap().clear();
+
+        // Slot 5 is marked: pending (CHECKED[3]) increments, tabled (CHECKED[5]) and missed (CHECKED[1], MISSED_ALL) do not.
+        mark(start + 5 * 32);
+        missed(5, start + 5 * 32, true, true);
+        assert_eq!(CHECKED[3].load(Relaxed), 1);
+        assert_eq!(CHECKED[1].load(Relaxed), 0);
+        assert_eq!(CHECKED[5].load(Relaxed), 0);
+        assert_eq!(MISSED_ALL.load(Relaxed), 0);
+
+        // Unmarked tabled view record increments both missed and tabled, plus MISSED_ALL.
+        missed(6, start + 6 * 32, true, true);
+        assert_eq!(CHECKED[1].load(Relaxed), 1);
+        assert_eq!(CHECKED[5].load(Relaxed), 1);
+        assert_eq!(MISSED_ALL.load(Relaxed), 1);
+
+        // Even after line() resets CHECKED[1], the global warn sequence continues past 20 without resetting.
+        for i in 7..28 {
+            missed(i, start + u64::from(i) * 32, true, false);
+        }
+        CHECKED[1].store(0, Relaxed);
+        let n_before = MISSED_ALL.load(Relaxed);
+        assert_eq!(n_before, 22);
+        assert!(!should_warn_missed(n_before));
+        missed(28, start + 28 * 32, true, false);
+        assert_eq!(CHECKED[1].load(Relaxed), 1);
+        assert_eq!(MISSED_ALL.load(Relaxed), 23);
+        assert!(should_warn_missed(32));
+        assert!(!should_warn_missed(33));
+
+        let_go(start);
+        WRITERS.lock().unwrap().clear();
     }
 }

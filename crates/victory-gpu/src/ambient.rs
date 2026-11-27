@@ -133,6 +133,77 @@ fn floor() -> f32 {
     *SET.get_or_init(|| parse_floor(&std::env::var("VICTORY_AMBIENT_MIN").unwrap_or_default()))
 }
 
+/// How the slow mean of the light around follows the frames
+/// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
+/// seconds>]]`; unset: 250,3; 0: 0.04 of the way a frame, as before, which is 25
+/// frames: 0.8 s at the console's 30 frames a second, 2-4 s at 7-13). Set,
+/// it is the same share of the way a second whatever the frame rate, and a
+/// change by more than the jump factor (default 3; 0: none) is taken at
+/// once. Fresh seconds (default 0: none): for that long after such a jump
+/// the light the title's own resolve left is bounded by the estimate, not
+/// four times it, rising back to four times by the end.
+#[derive(Clone, Copy)]
+struct Settle {
+    ms: f32,
+    jump: f32,
+    fresh: f32,
+}
+
+fn settle() -> Option<Settle> {
+    static SET: OnceLock<Option<Settle>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        // Default on (250 ms, jump factor 3: reports/LIGHT-POPIN.md); `0`
+        // gives the old 0.04 of the way a frame.
+        let set = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
+        let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
+        let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+        let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+        let fresh = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+        tracing::info!(
+            ms,
+            jump,
+            fresh,
+            "the stand-in's mean of the light around settles by the clock (VICTORY_AMBIENT_SETTLE)"
+        );
+        Some(Settle { ms, jump, fresh })
+    })
+}
+
+/// The share of the way the slow mean goes at this frame's keeping
+/// ([`Role::Radiance`]; the other passes do not read it).
+fn follow(role: Role) -> f32 {
+    match settle() {
+        Some(settle) if role == Role::Radiance => 1.0 - (-frame_ms(role) / settle.ms).exp(),
+        _ => 0.04,
+    }
+}
+
+/// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
+/// the first, and after a pause of over a second, as a frame of 30. Other
+/// roles: the last answer.
+fn frame_ms(role: Role) -> f32 {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static DT: AtomicU32 = AtomicU32::new(0x4204_0000); // 33.0
+    if role != Role::Radiance {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    // (Asked twice in a keeping: the words and the share.)
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if ASKED.swap(now, Relaxed) == now {
+        return f32::from_bits(DT.load(Relaxed));
+    }
+    let last = LAST.swap(now, Relaxed);
+    let dt = match now.saturating_sub(last) {
+        0 => 1.0,
+        dt if last == 0 || dt > 1000 => 33.0,
+        dt => dt as f32,
+    };
+    DT.store(dt.to_bits(), Relaxed);
+    dt
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -149,7 +220,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), UAV(u3)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -158,7 +229,8 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float floor_level;
+    float follow; float most; float air; uint probe;
+    float jump; float fresh; float dt; float floor_level;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -166,6 +238,9 @@ Texture2D<float> depth : register(t0);
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
+// For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
+// what the title's resolve left, what was found and what was written.
+RWByteAddressBuffer stats : register(u3);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
@@ -200,9 +275,14 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    if (was.a <= 0.0 && dot(now, LUMA) < 1e-4) return;
-    float rate = dot(now, LUMA) > dot(was.rgb, LUMA) ? max(follow, 0.25) : follow;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, rate) : now, 1.0);
+    // (`jump` > 0: a change of more than that factor either way is
+    // followed at once, as a new room is.)
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    // Its fourth part: seconds since the light around last jumped (from
+    // 0.001; 0: nothing kept yet).
+    float age = was.a > 0.0 && !jumped ? was.a + dt : 0.001;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, jumped ? 1.0 : follow) : now, age);
 }
 #endif
 
@@ -264,8 +344,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
-    float avg = lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
-    float cap = air * avg;
+    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
@@ -316,48 +395,59 @@ void raise(uint3 at : SV_DispatchThreadID) {
         }
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
-    float3 found = 0;
+    float3 found;
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
         light[p] = pack(found);
         return;
     }
-    if (level > 0.0) {
-        // Between the four points around, those at its own depth first; which
-        // four is dithered a little.
-        float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
-        int2 g0 = int2(floor(g));
-        float2 f = g - float2(g0);
-        float4 sr = 0, sg = 0, sb = 0;
-        float sum = 0;
-        for (int k = 0; k < 4; k++) {
-            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-            float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
-            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-            float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-            uint at0 = (q.y * PX + q.x) * 3;
-            sr += w * points[at0];
-            sg += w * points[at0 + 1];
-            sb += w * points[at0 + 2];
-            sum += w;
-        }
-        float3 all = float3(sr.w, sg.w, sb.w) / sum;
-        found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-        found = clamp(found, 0.2 * all, 2.5 * all);
-        found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // Between the four points around, those at its own depth first; which
+    // four is dithered a little.
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += w * points[at0];
+        sg += w * points[at0 + 1];
+        sb += w * points[at0 + 2];
+        sum += w;
     }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.2 * all, 2.5 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     if (floor_level > 0.0) {
         found = max(found, float3(1.0, 0.98, 0.94) * floor_level * open);
     }
     float3 was = unpack(light[p]);
-    // Magenta (green far below red and blue) is what the probes' memory held, not light.
+    // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
-    float top = max(dot(found, LUMA) * most, 1e-6);
+    // For `fresh` seconds after the light around jumped (a new room) the
+    // title's leftover counts for no more than the estimate, then up to
+    // `most` times it again: its history holds the place before.
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    float3 written = max(was, found);
+    light[p] = pack(written);
+    if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
+        uint ignored;
+        stats.InterlockedAdd(0, 1, ignored);
+        stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
+        stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
+        stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
+    }
 }
 #endif
 "#;
@@ -366,6 +456,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
+/// Where the slow mean is among the cells (float4s).
+pub(crate) const CELLS_AT: u32 = CELLS as u32;
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -377,6 +469,7 @@ struct Pass {
     air: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
+    stats: ID3D12Resource,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -417,6 +510,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         air,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
+        stats: made(256)?,
     })
 }
 
@@ -429,6 +523,15 @@ fn pass() -> Option<&'static Pass> {
             .ok()
     })
     .as_ref()
+}
+
+/// The probe's sums and the cells (with the slow mean), once the passes are
+/// made and the stand-in is on.
+pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
+    if !on() {
+        return None;
+    }
+    pass().map(|p| (p.stats.clone(), p.cells.clone()))
 }
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
@@ -465,12 +568,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
     };
-    let floor_level = if constant == 0.0 { floor() } else { 0.0 };
-    let kept = KEPT.load(Ordering::Relaxed);
-    if role == Role::Air && (constant > 0.0 || air() == 0.0 || !kept) {
+    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Resolve && constant == 0.0 && !kept && floor_level <= 0.0 {
+    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -483,23 +584,23 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
+    list.keep(&pass.stats);
     let [strength, radius] = shade();
-    let resolve_level = if role == Role::Resolve && constant == 0.0 && !kept {
-        0.0
-    } else {
-        level
-    };
-    let floats = [resolve_level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let floats = [level, constant, strength, radius, 0.1, 0.45];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
-    words[8] = 0.04f32.to_bits();
+    words[8] = follow(role).to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
-    words[11] = floor_level.to_bits();
+    words[11] = u32::from(crate::lightprobe::on());
+    words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
+    words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
+    words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = floor().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -507,11 +608,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(5, pass.stats.GetGPUVirtualAddress());
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
@@ -525,7 +627,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
-                if constant == 0.0 && kept {
+                if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
